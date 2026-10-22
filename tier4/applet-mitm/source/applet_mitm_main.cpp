@@ -1111,7 +1111,7 @@ namespace ams {
         /* M76: this line used to print jpg=off before jpg was parsed, and
          * called every build a "read-only observer". The flag dump below is
          * the record of what this boot armed. */
-        mitm::applet::LogLine("applet-mitm v0.7.14-ovl8: up (grc IPC interceptor %s), built against Atmosphere %d.%d.%d",
+        mitm::applet::LogLine("applet-mitm v0.7.14-ovl9: up (grc IPC interceptor %s), built against Atmosphere %d.%d.%d",
                               mitm::applet::g_grc_armed ? "ARMED" : "off",
                               ATMOSPHERE_RELEASE_VERSION_MAJOR, ATMOSPHERE_RELEASE_VERSION_MINOR, ATMOSPHERE_RELEASE_VERSION_MICRO);
         {
@@ -1306,7 +1306,7 @@ namespace ams {
          * alone - homebrew apps are then never streamed. Added while chasing
          * the keyboard bug; kept as an escape hatch should wrapping homebrew
          * ever break one. */
-        mitm::applet::OverlayArm();    /* v0.7.14: the overlays (overlays.txt; starts their thread), and Tesla's vi:m with them or the probe */
+        mitm::applet::OverlayArm(ArmFileContains("overlays"));    /* v0.7.14: the overlays (config overlays = 1, or overlays.txt; starts their thread), and Tesla's vi:m with them or the probe */
         if (ArmFileContains("nohb")) {
             mitm::applet::LogLine("vi:m NOT wrapped (homebrew = 0): homebrew apps are not streamed this boot");
         } else {

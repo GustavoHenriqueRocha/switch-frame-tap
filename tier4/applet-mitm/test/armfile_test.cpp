@@ -190,6 +190,11 @@ int main() {
     ExpectRelease("screenshot = 1\nscreenshot_buttons = 4\nscreenshot_custom = Capture\n", "vic exec dbg usb live nvqp=20 nvgop=60 wait=20 shot shotkey=4 shotmask=0 shotcap audio");
     ExpectRelease("screenshot = 1\nscreenshot_buttons = 4\n", "vic exec dbg usb live nvqp=20 nvgop=60 wait=20 shot shotkey=0 audio");
     ExpectRelease("detach_on_home = 1\n", "vic exec dbg usb live nvqp=20 nvgop=60 wait=20 audio");
+    /* v0.7.14: the HOME menu and the overlays (beta) */
+    ExpectRelease("home_menu = 1\n", "vic exec dbg usb live nvqp=20 nvgop=60 wait=20 audio homemenu");
+    ExpectRelease("overlays = 1\n", "vic exec dbg usb live nvqp=20 nvgop=60 wait=20 audio overlays");
+    ExpectRelease("overlays = 0\n", "vic exec dbg usb live nvqp=20 nvgop=60 wait=20 audio");
+    ExpectRelease("home_menu = 1\noverlays = 1\n", "vic exec dbg usb live nvqp=20 nvgop=60 wait=20 audio homemenu overlays");
     ExpectContains("vic live nodethome wait=20\n", "nodethome", true);
     ExpectContains("vic live wait=20\n", "nodethome", false);
 

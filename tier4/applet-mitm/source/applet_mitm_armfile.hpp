@@ -99,6 +99,8 @@ namespace ams::mitm::applet::armfile {
      *                                                  finished 1080p encode while waiting for the next frame)
      *   home_menu         = 1                        -> homemenu (v0.7.14: stream the HOME menu and the
      *                                                  system applets when no game is on screen; beta)
+     *   overlays          = 1                        -> overlays (v0.7.14: the volume bar, quick settings,
+     *                                                  power menu and Tesla/Ultrahand in the stream; beta)
      *
      * Unknown keys and malformed values are ignored: a bad config file must
      * leave the defaults, never arm something else. */
@@ -145,7 +147,7 @@ namespace ams::mitm::applet::armfile {
     inline size_t BuildReleaseArm(const char *ini, size_t n, char *out, size_t cap) {
         unsigned qp = 20, gop = 60, wait = 20, u = 0;
         unsigned shotkey = 0;
-        bool cap720 = false, anyfw = false, shot = false, audio = true, uvc = false, uvcraw = false, nvab = false, net = false, nohb = false, nodethome = false, shotalbum = false, screenoff = false, earlyoff = false, earlyab = false, homemenu = false;
+        bool cap720 = false, anyfw = false, shot = false, audio = true, uvc = false, uvcraw = false, nvab = false, net = false, nohb = false, nodethome = false, shotalbum = false, screenoff = false, earlyoff = false, earlyab = false, homemenu = false, overlays = false;
         char v[32];
         if (IniValue(ini, n, "quality", v, sizeof(v))) {
             if (std::strcmp(v, "medium") == 0) { qp = 24; }
@@ -175,6 +177,7 @@ namespace ams::mitm::applet::armfile {
         if (IniValue(ini, n, "detach_on_home", v, sizeof(v)) && std::strcmp(v, "0") == 0) { nodethome = true; }
         if (IniValue(ini, n, "screen_off", v, sizeof(v)) && std::strcmp(v, "1") == 0) { screenoff = true; }
         if (IniValue(ini, n, "home_menu", v, sizeof(v)) && std::strcmp(v, "1") == 0) { homemenu = true; }
+        if (IniValue(ini, n, "overlays", v, sizeof(v)) && std::strcmp(v, "1") == 0) { overlays = true; }
         if (IniValue(ini, n, "early_collect", v, sizeof(v))) {
             if (std::strcmp(v, "0") == 0) { earlyoff = true; }
             else if (std::strcmp(v, "ab") == 0) { earlyab = true; }
@@ -192,11 +195,11 @@ namespace ams::mitm::applet::armfile {
             std::snprintf(shotbuf, sizeof(shotbuf), " shot shotkey=%u%s%s", shotkey, custom, shotalbum ? " shotalbum" : "");
         }
         /* one transport: "usb" (the viewer or, with uvc, the webcam) or "net" */
-        const int w = std::snprintf(out, cap, "vic exec dbg %s live nvqp=%u nvgop=%u wait=%u%s%s%s%s%s%s%s%s%s%s%s%s%s",
+        const int w = std::snprintf(out, cap, "vic exec dbg %s live nvqp=%u nvgop=%u wait=%u%s%s%s%s%s%s%s%s%s%s%s%s%s%s",
                                     net ? "net" : "usb", qp, gop, wait, cap720 ? " cap720" : "", anyfw ? " anyfw" : "", shotbuf, audio ? " audio" : "",
                                     uvc ? " uvc" : "", uvcraw ? " uvcraw" : "", nvab ? " nvab" : "", nohb ? " nohb" : "",
                                     nodethome ? " nodethome" : "", screenoff ? " screenoff" : "",
-                                    earlyoff ? " earlyoff" : "", earlyab ? " earlyab" : "", homemenu ? " homemenu" : "");
+                                    earlyoff ? " earlyoff" : "", earlyab ? " earlyab" : "", homemenu ? " homemenu" : "", overlays ? " overlays" : "");
         return (w < 0 || static_cast<size_t>(w) >= cap) ? 0 : static_cast<size_t>(w);
     }
 

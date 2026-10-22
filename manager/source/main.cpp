@@ -218,6 +218,7 @@ namespace {
         bool screen_off = false;  /* v0.7.12: the console's screen dark while streaming */
         std::string early = "1";  /* v0.7.12: early_collect (1 / 0 / ab); kept when saving */
         bool home_menu = false;   /* v0.7.14: stream the HOME menu and system applets too (beta); from the next boot */
+        bool overlays = false;    /* v0.7.14: the system overlays in the stream (beta); from the next boot */
         int conn = 0;           /* v0.7: connection - 0 USB (PC viewer), 1 USB webcam, 2 (v0.7.7) USB webcam NV12, 3 network; from the next boot */
     };
 
@@ -266,6 +267,7 @@ namespace {
         if (IniGet(ini, "early_collect", &v) && (v == "0" || v == "1" || v == "ab")) { s.early = v; }
         if (IniGet(ini, "audio", &v)) { s.audio = v != "0"; }
         if (IniGet(ini, "home_menu", &v)) { s.home_menu = v == "1"; }
+        if (IniGet(ini, "overlays", &v)) { s.overlays = v == "1"; }
         /* the v0.4-v0.7 keys first, then the one that replaced them */
         if (IniGet(ini, "usb_mode", &v) && v == "webcam") { s.conn = 1; }
         if (IniGet(ini, "network", &v) && v == "1") { s.conn = ConnNetwork; }
@@ -316,10 +318,12 @@ namespace {
             "#             network (the PC viewer over Wi-Fi or the dock's LAN port - play docked). Read at boot.\n"
             "connection = %s\n"
             "# home_menu: 1 = also stream the HOME menu and the system applets when no game is on screen (beta). Read at boot.\n"
-            "home_menu = %d\n",
+            "home_menu = %d\n"
+            "# overlays: 1 = the volume bar, quick settings, power menu and Tesla/Ultrahand menus in the stream (beta). Read at boot.\n"
+            "overlays = %d\n",
             QualityKeys[s.quality], KeyframeFrames[s.keyframe], s.cap720 ? "720" : "1080",
             DelaySeconds[s.delay], s.any_fw ? 1 : 0, s.shot ? 1 : 0, s.shot_combo, custom, s.shot_album ? "album" : "app", s.detach_home ? 1 : 0, s.screen_off ? 1 : 0, s.early.c_str(),
-            s.audio ? 1 : 0, ConnKeys[s.conn], s.home_menu ? 1 : 0);
+            s.audio ? 1 : 0, ConnKeys[s.conn], s.home_menu ? 1 : 0, s.overlays ? 1 : 0);
         std::fclose(f);
         return true;
     }
@@ -482,6 +486,7 @@ namespace {
         int RunningConn() { return have_status ? ((st.reserved3 & 2) ? ConnNetwork : (st.reserved3 & 1) ? ((st.reserved3 & 8) ? 2 : 1) : 0) : set.conn; }
         bool RunningWebcam() { return RunningConn() == 1; }
         bool RunningHomeMenu() { return have_status ? (st.reserved3 & 16) != 0 : set.home_menu; }   /* v0.7.14 */
+        bool RunningOverlays() { return have_status ? (st.reserved3 & 32) != 0 : set.overlays; }     /* v0.7.14 */
         /* v0.7: the network transport this boot, and whether a viewer is on it */
         bool RunningNetwork() { return RunningConn() == ConnNetwork; }
         bool NetworkViewer() { return have_status && (st.reserved3 & 4) != 0; }
@@ -639,6 +644,22 @@ namespace {
                 "Also streams the HOME menu and the system screens when no game is on screen: the HOME menu itself, "
                 "System Settings, the user picker, Controllers, My Page, the Album and the Homebrew Menu. "
                 "No sound outside games yet. Beta: off by default, and a reboot applies it." });
+
+            rows.push_back({ Kind::Setting, "Overlays (beta)", [this] {
+                    std::string v = set.overlays ? "On" : "Off";
+                    if (have_status && RunningOverlays() != set.overlays) { v += " - after a reboot"; }
+                    return v;
+                }, [this] { return (have_status && RunningOverlays() != set.overlays) ? ColWarn : set.overlays ? ColGood : ColDim; },
+                [this](int) {
+                    set.overlays = !set.overlays;
+                    if (!SaveSettings(set)) { Toast("Could not write config.ini"); return; }
+                    Toast(test_install ? "Saved - but a test arm file is installed, so the sysmodule ignores config.ini"
+                                       : "Saved - restart the console to apply");
+                },
+                "Puts the console's overlays in the stream, on top of the game: the volume bar, the quick settings "
+                "(hold HOME), the power menu (hold POWER) and Tesla / Ultrahand menus. They are copied 10-20 times a "
+                "second, so they move less smoothly than the game, and the power menu is a little soft. "
+                "Beta: off by default, and a reboot applies it." });
 
             rows.push_back({ Kind::Header, "Picture", nullptr, nullptr, nullptr, "" });
             rows.push_back({ Kind::Setting, "Quality", [this] { return std::string(QualityNames[set.quality]); }, nullptr,

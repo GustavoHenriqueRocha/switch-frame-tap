@@ -1,6 +1,7 @@
 /*
- * v0.7.14: the system overlays in the stream. Off unless
- * sdmc:/config/switch-frame-tap/overlays.txt exists (beta).
+ * v0.7.14: the system overlays in the stream. Off unless config.ini has
+ * overlays = 1 (the manager's toggle) or sdmc:/config/switch-frame-tap/
+ * overlays.txt exists (test builds); beta.
  *
  * The stream copies the game's own frames, before the console composites
  * anything over them, and the composited screen cannot be read. So the
@@ -614,12 +615,12 @@ namespace ams::mitm::applet {
 
     }
 
-    void OverlayArm() {
-        g_armed = FileThere(OverlaysFile);
+    void OverlayArm(bool on) {
+        g_armed = on || FileThere(OverlaysFile);
         const bool probe = SFT_OVL_PROBE && FileThere(ProbeFile);
         if (g_armed || probe) { g_ovl_vi_mitm.store(true, std::memory_order_relaxed); }
         if (g_armed) {
-            LogLine("overlays: on (overlays.txt) - the volume bar and Tesla/Ultrahand in the stream; Tesla's new vi:m sessions are wrapped (never captured)");
+            LogLine("overlays: on (%s) - the volume bar, quick settings, power menu and Tesla/Ultrahand in the stream; Tesla's new vi:m sessions are wrapped (never captured)", on ? "config" : "overlays.txt");
             SFT_ABORT_UNLESS(os::CreateThread(std::addressof(g_ovl_thread), OverlayThread, nullptr, g_ovl_stack, sizeof(g_ovl_stack), os::GetThreadPriority(os::GetCurrentThread())));
             os::SetThreadNamePointer(std::addressof(g_ovl_thread), "applet-mitm.Overlays");
             os::StartThread(std::addressof(g_ovl_thread));

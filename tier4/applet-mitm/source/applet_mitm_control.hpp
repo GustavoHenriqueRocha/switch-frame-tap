@@ -38,7 +38,8 @@ namespace ams::mitm::applet {
         u32 app_excluded;
         u32 reserved3;       /* v0.4: bit 0 - this boot is in webcam (UVC) mode; v0.7: bit 1 - network
                                 transport on, bit 2 - a viewer is connected over the network;
-                                v0.7.7: bit 3 - webcam-any; v0.7.14: bit 4 - this boot streams the HOME menu */
+                                v0.7.7: bit 3 - webcam-any; v0.7.14: bit 4 - this boot streams the HOME menu,
+                                bit 5 - and the system overlays */
     };
     static_assert(sizeof(StreamStatus) == 64);
 

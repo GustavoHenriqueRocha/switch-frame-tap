@@ -2,8 +2,9 @@
  * v0.7.14: the system overlays in the stream (applet_mitm_overlay.cpp) - the
  * volume bar (overlayDisp) and Tesla / Ultrahand, read from their processes'
  * memory and blended over the game by the VIC job that already converts each
- * frame. Off unless sdmc:/config/switch-frame-tap/overlays.txt exists (test
- * builds; beta).
+ * frame. Off unless config.ini has overlays = 1 (arm token "overlays", the
+ * manager's toggle) or sdmc:/config/switch-frame-tap/overlays.txt exists
+ * (test builds); beta.
  */
 #pragma once
 #include <stratosphere.hpp>
@@ -20,11 +21,11 @@ namespace ams::mitm::applet {
     extern std::atomic<u32> g_tesla_txns, g_tesla_presents;
     void OvlNoteTeslaTransaction(u32 code, const void *in, size_t in_size);
 
-    /* at startup, before vi:m is registered: overlays.txt (or the overlay
-     * probe's file) turns on the Tesla wrap; overlays.txt the overlays and
-     * their thread (ovl3 started the thread before reading the file - it
-     * never ran) */
-    void OverlayArm();
+    /* at startup, before vi:m is registered: on (config overlays = 1) or
+     * overlays.txt turns on the overlays, their thread and the Tesla wrap;
+     * the overlay probe's file the wrap alone (ovl3 started the thread before
+     * reading the file - it never ran) */
+    void OverlayArm(bool on);
     bool OverlaysArmed();
 
     /* the VIC side. The engines lend the overlays a buffer area the VIC can

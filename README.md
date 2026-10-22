@@ -827,7 +827,7 @@ dock works over the network since v0.7.0, with the quality adapting to the link.
 | Hardware decode in the viewer (VAAPI/NVDEC on Linux, D3D11VA on Windows; VideoToolbox on macOS, off by default there) | **done, on hardware** (v0.7.12; Windows v0.7.13) |
 | USB 3.0 lossless (handheld) | parked: the link still trains to High Speed |
 | The HOME menu and the system screens (System Settings, the user picker, the homebrew menu from the Album) | **beta** (v0.7.14-beta1, opt-in: **HOME menu (beta)** in the manager; no sound there yet) |
-| System overlays (the volume bar, notifications) and Tesla/Ultrahand in the stream | research: their pixels are found and decoded (v0.7.14 probe 1); blending them in on the console is being tested |
+| System overlays (the volume bar, quick settings, the power menu) and Tesla/Ultrahand in the stream | **works on hardware**, coming as a beta (v0.7.14, opt-in: **Overlays (beta)** in the manager; copied 10-20 times a second, the power menu at half resolution) |
 
 ## Layout
 
