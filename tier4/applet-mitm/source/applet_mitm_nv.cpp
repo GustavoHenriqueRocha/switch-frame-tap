@@ -1848,7 +1848,9 @@ namespace ams::mitm::applet {
     u8 *VicBounceBuffer() {
         return g_vic_heap != 0 ? reinterpret_cast<u8 *>(g_vic_heap + VicBounceOff) : nullptr;
     }
-    size_t VicBounceBufferSize() { return VicBounceSize; }
+    /* v0.7.14: the lower 1 MB - the overlays work in the upper (cached memory;
+     * the buffers the VIC reads are uncached, slow for the CPU) */
+    size_t VicBounceBufferSize() { return VicBounceSize / 2; }
 
     constinit bool g_dump_armed    = false;
     constinit u32  g_probe_delay_s = 120;
@@ -2332,7 +2334,10 @@ namespace ams::mitm::applet {
         if (!g_live_armed) { TryIndirectCapture(); }
         /* v0.7.14: the overlays' buffers live past the self-tests' 64 KB of our
          * output buffer, which streaming does not use */
-        if (dst_addr != 0) { OverlayAreaUp(g_vic_dst_buf + DstSize, dst_addr + static_cast<u32>(DstSize), VicDstSize - DstSize); }
+        if (dst_addr != 0) {
+            OverlayAreaUp(g_vic_dst_buf + DstSize, dst_addr + static_cast<u32>(DstSize), VicDstSize - DstSize,
+                          reinterpret_cast<u8 *>(g_vic_heap + VicBounceOff + VicBounceSize / 2), VicBounceSize / 2);
+        }
         TryDebugCapture(vfd, nvmap_fd, cmd_handle, syncpt, cfg_addr, dst_addr);
         /* M75: gated. This has completed cleanly in every run (its cmdbuf is an
          * IMMEDIATE increment with no engine op), but the point of an observer

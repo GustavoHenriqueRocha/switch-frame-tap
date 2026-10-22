@@ -24,6 +24,13 @@
  * straight alpha whatever its factor fields say (the blend card, ovl2). The
  * VIC job adds them as slots 1 and 2 only while they show - with no overlay
  * on screen the job is the same as without this.
+ * That area is uncached (the VIC reads it), and the CPU is slow there - ovl3b
+ * spent 13% of a core hashing it. Reads, hashes and conversions happen in
+ * cached memory (the upper 1 MB of the dmnt:cht bounce); only finished
+ * pixels are copied in. overlayDisp has no "frame done" signal: a read that
+ * overlapped its drawing gave a torn notification (ovl3b, a dotted icon over
+ * the previous picture), so a corner is taken only when two reads in a row
+ * agree.
  * No floats are formatted (a stratosphere module has no newlib heap).
  */
 #include <stratosphere.hpp>
@@ -59,6 +66,7 @@ namespace ams::mitm::applet {
         /* the area the engines lend */
         constinit os::SdkMutex g_area_lock;
         constinit u8 *g_area = nullptr;
+        constinit u8 *g_cached = nullptr;
         constinit std::atomic<u32> g_area_dev{0};
         constinit std::atomic<bool> g_area_up{false};
 
@@ -75,9 +83,15 @@ namespace ams::mitm::applet {
         constexpr size_t TeslaDstBuf = 6 * TeslaDstRow;         /* 1344 KB */
         constexpr size_t OffBar[2]   = { 0, BarBytes };
         constexpr size_t OffTesla[2] = { 2 * BarBytes, 2 * BarBytes + TeslaDstBuf };
-        constexpr size_t OffScratch  = 2 * BarBytes + 2 * TeslaDstBuf;
-        constexpr size_t AreaNeeded  = OffScratch + TeslaSrcRow;
+        constexpr size_t AreaNeeded  = 2 * BarBytes + 2 * TeslaDstBuf;
         static_assert(AreaNeeded <= 0x330000, "the overlays must fit the VIC output buffer past the self-tests' 64 KB");
+        /* the cached working memory: two reads of the bar's corner, one block
+         * row of Tesla's in and out */
+        constexpr size_t CachedBar[2]   = { 0, BarBytes };
+        constexpr size_t CachedTeslaIn  = 2 * BarBytes;
+        constexpr size_t CachedTeslaOut = CachedTeslaIn + TeslaSrcRow;
+        constexpr size_t CachedNeeded   = CachedTeslaOut + TeslaDstRow;
+        static_assert(CachedNeeded <= 0x100000);
 
         constexpr u64 OdBufBytes = UINT64_C(1280) * 768 * 4;     /* one overlayDisp buffer */
         constexpr u64 OdRegionBytes = 2 * OdBufBytes;            /* 7680 KB */
@@ -229,8 +243,9 @@ namespace ams::mitm::applet {
         constinit u32 g_bar_copies = 0, g_tesla_frames = 0;
         constinit u64 g_work_ns = 0;
 
-        /* the volume bar: read one buffer's corner (they alternate); copy it
-         * when it changed */
+        /* the volume bar: one buffer's corner a tick (they alternate). When it
+         * differs from the last look it is read again: two reads that agree
+         * are a finished picture (not one being drawn) - copied in */
         constinit u32 g_bar_hash[2] = {}, g_bar_turn = 0;
         constinit bool g_bar_seen[2] = {};
         void StepBar() {
@@ -239,23 +254,31 @@ namespace ams::mitm::applet {
                 g_bar_seen[0] = g_bar_seen[1] = false;
             }
             const u32 b = (g_bar_turn++) & 1;
-            const u32 pub = g_bar_pub.load(std::memory_order_relaxed);
-            const u32 di = (pub & 2) ? ((pub & 1) ^ 1) : 0;    /* never the buffer being shown */
-            u8 *dst = g_area + OffBar[di];
-            if (!DbgRead(g_od.h, dst, g_od.base + b * OdBufBytes, BarBytes)) { Detach(g_od, "read failed"); return; }
-            const u32 h = Fnv(dst, BarBytes);
+            u8 *r0 = g_cached + CachedBar[0], *r1 = g_cached + CachedBar[1];
+            const u64 va = g_od.base + b * OdBufBytes;
+            if (!DbgRead(g_od.h, r0, va, BarBytes)) { Detach(g_od, "read failed"); return; }
+            const u32 h = Fnv(r0, BarBytes);
             if (!g_bar_seen[b]) { g_bar_seen[b] = true; g_bar_hash[b] = h; return; }   /* the first look is not a change */
             if (h == g_bar_hash[b]) { return; }
+            const u32 pub = g_bar_pub.load(std::memory_order_relaxed);
+            if (!DbgRead(g_od.h, r1, va, BarBytes)) { Detach(g_od, "read failed"); return; }
+            if (std::memcmp(r0, r1, BarBytes) != 0) {
+                /* being drawn: it still changes, so what shows stays up */
+                if (pub & 2) { g_bar_change_tick.store(armGetSystemTick(), std::memory_order_relaxed); }
+                return;
+            }
             g_bar_hash[b] = h;
-            const bool any = Unpremultiply(dst, BarBytes);
-            armDCacheFlush(dst, BarBytes);
+            const bool any = Unpremultiply(r0, BarBytes);
+            const u32 di = (pub & 2) ? ((pub & 1) ^ 1) : 0;    /* never the buffer being shown */
+            std::memcpy(g_area + OffBar[di], r0, BarBytes);
+            armDCacheFlush(g_area + OffBar[di], BarBytes);
             g_bar_change_tick.store(any ? armGetSystemTick() : 0, std::memory_order_relaxed);
             g_bar_pub.store(di | (any ? 2u : 0u), std::memory_order_release);
             ++g_bar_copies;
         }
 
         /* Tesla: while it presents, its last queued buffer 10 times a second */
-        constinit u32 g_tesla_gen_seen = 0;
+        constinit u32 g_tesla_gen_seen = 0, g_tesla_hash = 0;
         constinit u64 g_tesla_next_ns = 0;
         void StepTesla() {
             const u64 age = AgoNs(g_tesla_present_tick.load(std::memory_order_relaxed));
@@ -277,16 +300,28 @@ namespace ams::mitm::applet {
             g_tesla_gen_seen = gen;
             if (g_tesla.h == svc::InvalidHandle && !Attach(g_tesla, TeslaProgramId, TeslaRegion)) { return; }
             const u32 slot = g_tesla_slot.load(std::memory_order_relaxed) & 1;
+            const u64 src = g_tesla.base + slot * TeslaSrcBuf;
+            u8 *in = g_cached + CachedTeslaIn, *out = g_cached + CachedTeslaOut;
+            /* a menu sits still most of the time: compare first, convert only
+             * a changed picture */
+            u32 h = 2166136261u;
+            for (u32 r = 0; r < 6; ++r) {
+                if (!DbgRead(g_tesla.h, in, src + r * TeslaSrcRow, TeslaSrcRow)) { Detach(g_tesla, "read failed"); return; }
+                h = (h ^ Fnv(in, TeslaSrcRow)) * 16777619u;
+                Pump(g_tesla);
+            }
             const u32 pub = g_tesla_pub.load(std::memory_order_relaxed);
+            if ((pub & 2) && h == g_tesla_hash) { return; }
             const u32 di = (pub & 2) ? ((pub & 1) ^ 1) : 0;
             u8 *dst = g_area + OffTesla[di];
-            u8 *scratch = g_area + OffScratch;
             for (u32 r = 0; r < 6; ++r) {
-                if (!DbgRead(g_tesla.h, scratch, g_tesla.base + slot * TeslaSrcBuf + r * TeslaSrcRow, TeslaSrcRow)) { Detach(g_tesla, "read failed"); return; }
-                ConvertTeslaRow(scratch, dst + r * TeslaDstRow);
+                if (!DbgRead(g_tesla.h, in, src + r * TeslaSrcRow, TeslaSrcRow)) { Detach(g_tesla, "read failed"); return; }
+                ConvertTeslaRow(in, out);
+                std::memcpy(dst + r * TeslaDstRow, out, TeslaDstRow);
                 Pump(g_tesla);
             }
             armDCacheFlush(dst, TeslaDstBuf);
+            g_tesla_hash = h;
             g_tesla_pub.store(di | 2u, std::memory_order_release);
             ++g_tesla_frames;
         }
@@ -354,10 +389,11 @@ namespace ams::mitm::applet {
         if (!ok) { LogLine("overlays: OFF for this boot - the blend check failed"); }
     }
 
-    void OverlayAreaUp(u8 *cpu, u32 dev, size_t size) {
-        if (!g_armed || cpu == nullptr || dev == 0 || size < AreaNeeded) { return; }
+    void OverlayAreaUp(u8 *cpu, u32 dev, size_t size, u8 *cached, size_t cached_size) {
+        if (!g_armed || cpu == nullptr || dev == 0 || size < AreaNeeded || cached == nullptr || cached_size < CachedNeeded) { return; }
         std::scoped_lock lk(g_area_lock);
         g_area = cpu;
+        g_cached = cached;
         g_area_dev.store(dev, std::memory_order_relaxed);
         g_bar_pub.store(0, std::memory_order_relaxed);
         g_tesla_pub.store(0, std::memory_order_relaxed);
@@ -369,6 +405,7 @@ namespace ams::mitm::applet {
         std::scoped_lock lk(g_area_lock);
         g_area_up.store(false, std::memory_order_relaxed);
         g_area = nullptr;
+        g_cached = nullptr;
         g_area_dev.store(0, std::memory_order_relaxed);
         g_bar_pub.store(0, std::memory_order_relaxed);
         g_tesla_pub.store(0, std::memory_order_relaxed);

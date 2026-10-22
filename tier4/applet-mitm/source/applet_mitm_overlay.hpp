@@ -30,7 +30,8 @@ namespace ams::mitm::applet {
     /* the VIC side. The engines lend the overlays a buffer area the VIC can
      * read (cpu/dev), while they are up; Down waits for the source thread to
      * leave it before the memory goes. */
-    void OverlayAreaUp(u8 *cpu, u32 dev, size_t size);
+    /* cached: plain cached memory for the CPU's work (the area is uncached) */
+    void OverlayAreaUp(u8 *cpu, u32 dev, size_t size, u8 *cached, size_t cached_size);
     void OverlayAreaDown();
     /* the overlay blend test at the first engine setup said whether the
      * format reads alpha from the last byte (true: the overlays stream) */
