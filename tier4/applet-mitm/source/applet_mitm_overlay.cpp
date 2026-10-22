@@ -338,7 +338,7 @@ namespace ams::mitm::applet {
                 if (any && col < left) { left = col; }
             }
             LogLine("overlays/qs: buffer %u, right half of rows 256-383 changed: %u%% shows, from x=%u", b,
-                    shown * 100 / (40 * BlockBytes / 4), left < 40 ? 640 + left * 16 : 0);
+                    static_cast<u32>(shown * 100 / (40 * BlockBytes / 4)), left < 40 ? 640 + left * 16 : 0u);
             if (!g_qs_moving) { QsSave(b, "start"); }
             g_qs_moving = true;
             g_qs_last_change = now;
