@@ -13,6 +13,9 @@
  *     second per buffer; when it changed it is copied, and shown for 2.5 s
  *     after its last change (the buffers keep the bar after it fades, so the
  *     content alone cannot say it is gone - probe 2).
+ *   - the quick settings panel (hold HOME) is overlayDisp's too: x 816-1279,
+ *     the full height, and its pixels clear when it closes (the probe, ovl4) -
+ *     shown while they are there, copied five times a second.
  *   - Tesla / Ultrahand (nx-ovlloader) draws 2 x 448x720 RGBA4444 (1344 KB,
  *     premultiplied). Its presents come through vi:m (wrapped while this is
  *     on); while it presents, the buffer it last queued is looked at 10 times
@@ -53,13 +56,9 @@ namespace ams::mitm::applet {
 
         constexpr const char *OverlaysFile = "sdmc:/config/switch-frame-tap/overlays.txt";
         constexpr const char *ProbeFile    = "sdmc:/config/switch-frame-tap/probe-ovl.txt";
-        /* research: the quick settings panel (hold HOME) - where it is drawn,
-         * and whether its pixels stay after it closes, as the volume bar's do */
-        constexpr const char *QsProbeFile  = "sdmc:/config/switch-frame-tap/probe-qs.txt";
         constexpr u64 OverlayDispProgramId = UINT64_C(0x010000000000100C);
 
         constinit bool g_armed = false;
-        constinit bool g_qs_probe = false;
         constinit std::atomic<bool> g_calibrated{false};
 
         /* Tesla's presents, from its binder (the vi:m wrap) */
@@ -85,18 +84,27 @@ namespace ams::mitm::applet {
         constexpr size_t TeslaSrcBuf = 6 * TeslaSrcRow;         /* one buffer, 768 rows (672 KB) */
         constexpr size_t TeslaRegion = 2 * TeslaSrcBuf;         /* 1344 KB */
         constexpr size_t TeslaDstRow = 28 * BlockBytes;         /* the same rows in RGBA8 (224 KB) */
-        constexpr size_t TeslaDstBuf = 6 * TeslaDstRow;         /* 1344 KB */
+        /* the quick settings panel: x 816-1279 (GOB columns 51-79), all six
+         * block rows of an overlayDisp buffer */
+        constexpr u32 QsX = 816, QsW = 464, QsH = 720, QsCol0 = 51, QsCols = 29;
+        constexpr size_t QsRow = QsCols * BlockBytes;           /* 232 KB */
+        /* Tesla and the quick settings panel share two "big" buffers - they
+         * rarely show together, and when they do the panel wins */
+        constexpr size_t BigBuf = 6 * QsRow;                    /* 1392 KB; Tesla uses 1344 of it */
         constexpr size_t OffBar[2]   = { 0, BarBytes };
-        constexpr size_t OffTesla[2] = { 2 * BarBytes, 2 * BarBytes + TeslaDstBuf };
-        constexpr size_t AreaNeeded  = 2 * BarBytes + 2 * TeslaDstBuf;
+        constexpr size_t OffBig[2]   = { 2 * BarBytes, 2 * BarBytes + BigBuf };
+        constexpr size_t AreaNeeded  = 2 * BarBytes + 2 * BigBuf;
         static_assert(AreaNeeded <= 0x330000, "the overlays must fit the VIC output buffer past the self-tests' 64 KB");
-        /* the cached working memory: the bar's corner, one of Tesla's buffers,
-         * a block row of it converted */
+        /* the cached working memory: the bar's corner, one of Tesla's buffers
+         * (or a row of the panel), a block row converted, the conversion's
+         * tables */
         constexpr size_t CachedBar      = 0;
         constexpr size_t CachedTeslaIn  = BarBytes;
         constexpr size_t CachedTeslaOut = CachedTeslaIn + TeslaSrcBuf;
-        constexpr size_t CachedNeeded   = CachedTeslaOut + TeslaDstRow;
-        static_assert(CachedNeeded <= 0x140000);
+        constexpr size_t CachedLutRg    = CachedTeslaOut + TeslaDstRow;   /* u16[16][256]: r,g for an alpha and a first byte */
+        constexpr size_t CachedLutB     = CachedLutRg + 16 * 256 * 2;     /* u8[16][16]: b for an alpha */
+        constexpr size_t CachedNeeded   = CachedLutB + 256;
+        static_assert(CachedNeeded <= 0x140000 && QsRow <= TeslaSrcBuf);
 
         constexpr u64 OdBufBytes = UINT64_C(1280) * 768 * 4;     /* one overlayDisp buffer */
         constexpr u64 OdRegionBytes = 2 * OdBufBytes;            /* 7680 KB */
@@ -105,6 +113,8 @@ namespace ams::mitm::applet {
         constinit std::atomic<u32> g_bar_pub{0};
         constinit std::atomic<u64> g_bar_change_tick{0};
         constinit std::atomic<u32> g_tesla_pub{0};
+        constinit std::atomic<u32> g_qs_pub{0};
+        constinit std::atomic<bool> g_qs_active{false};
         constexpr u64 BarHoldNs   = UINT64_C(2500000000);        /* shown this long after its last change */
         constexpr u64 TeslaHoldNs = UINT64_C(300000000);         /* shown while it presented this recently */
 
@@ -228,6 +238,8 @@ namespace ams::mitm::applet {
          * low nibble of the first byte ... a in the high nibble of the second,
          * premultiplied) -> straight RGBA8 (28 GOB columns) */
         void ConvertTeslaRow(const u8 *src, u8 *dst) {
+            const u16 *lut_rg = reinterpret_cast<const u16 *>(g_cached + CachedLutRg);
+            const u8 *lut_b = g_cached + CachedLutB;
             for (u32 gx = 0; gx < 14; ++gx) {
                 for (u32 gy = 0; gy < 16; ++gy) {
                     const u8 *sg = src + gx * BlockBytes + gy * 512;
@@ -236,16 +248,11 @@ namespace ams::mitm::applet {
                     for (u32 y = 0; y < 8; ++y) {
                         for (u32 x = 0; x < 32; ++x) {
                             const u8 *s = sg + g_src_off[y][x];
-                            const u32 a = (s[1] >> 4) * 17;
-                            u8 *d = (x < 16 ? dg0 : dg1) + g_dst_off[y][x & 15];
-                            if (a == 0) { d[0] = d[1] = d[2] = d[3] = 0; continue; }
-                            const u32 r = (s[0] & 15) * 17, g = (s[0] >> 4) * 17, b = (s[1] & 15) * 17;
-                            const u32 inv = g_inv[a];
-                            const u32 rr = (r * inv) >> 16, gg = (g * inv) >> 16, bb = (b * inv) >> 16;
-                            d[0] = static_cast<u8>(rr > 255 ? 255 : rr);
-                            d[1] = static_cast<u8>(gg > 255 ? 255 : gg);
-                            d[2] = static_cast<u8>(bb > 255 ? 255 : bb);
-                            d[3] = static_cast<u8>(a);
+                            const u32 a4 = s[1] >> 4;
+                            /* the tables hold c * 255 / a for every 4-bit pair
+                             * (ovl4 worked it out per pixel: ~2 ms a strip) */
+                            const u32 px = a4 == 0 ? 0u : (lut_rg[a4 * 256 + s[0]] | (static_cast<u32>(lut_b[a4 * 16 + (s[1] & 15)]) << 16) | ((a4 * 17) << 24));
+                            *reinterpret_cast<u32 *>((x < 16 ? dg0 : dg1) + g_dst_off[y][x & 15]) = px;
                         }
                     }
                 }
@@ -290,58 +297,53 @@ namespace ams::mitm::applet {
             ++g_bar_copies;
         }
 
-        /* research (probe-qs.txt): the right half of a buffer's middle rows
-         * (x 640-1279, y 256-383 - one 128-row block row, GOB columns 40-79,
-         * 320 KB in one piece), looked at with the bar; changes logged with
-         * how much of it shows and from which x, and the whole buffer saved
-         * when it starts changing and once it has sat still for 3 s */
-        constinit u32 g_qs_hash[2] = {}, g_qs_saves = 0;
-        constinit bool g_qs_seen[2] = {}, g_qs_moving = false;
-        constinit u64 g_qs_last_change = 0;
-        void QsSave(u32 b, const char *why) {
-            if (g_qs_saves >= 6) { return; }
-            static_cast<void>(fs::CreateDirectory("sdmc:/config/switch-frame-tap/probe"));
-            char path[96];
-            std::snprintf(path, sizeof(path), "sdmc:/config/switch-frame-tap/probe/qs-%u-%s-buf%u.bin", g_qs_saves++, why, b);
-            static_cast<void>(fs::DeleteFile(path));
-            if (R_FAILED(fs::CreateFile(path, static_cast<s64>(OdBufBytes)))) { return; }
-            fs::FileHandle f;
-            if (R_FAILED(fs::OpenFile(std::addressof(f), path, fs::OpenMode_Write))) { return; }
-            u8 *buf = g_cached + CachedTeslaIn;
-            for (u64 off = 0; off < OdBufBytes; off += TeslaSrcBuf) {
-                const size_t n = static_cast<size_t>(OdBufBytes - off < TeslaSrcBuf ? OdBufBytes - off : TeslaSrcBuf);
-                if (!DbgRead(g_od.h, buf, g_od.base + b * OdBufBytes + off, n)) { std::memset(buf, 0, n); }
-                static_cast<void>(fs::WriteFile(f, static_cast<s64>(off), buf, n, fs::WriteOption::None));
-                Pump(g_od);
-            }
-            static_cast<void>(fs::FlushFile(f));
-            fs::CloseFile(f);
-            LogLine("overlays/qs: saved %s", path);
-        }
-        void StepQsProbe(u32 b) {
-            constexpr size_t Off = (2 * 80 + 40) * BlockBytes, Bytes = 40 * BlockBytes;
-            u8 *r = g_cached + CachedTeslaIn;
-            if (!DbgRead(g_od.h, r, g_od.base + b * OdBufBytes + Off, Bytes)) { return; }
-            const u32 h = Fnv(r, Bytes);
-            const u64 now = NowNs();
-            if (!g_qs_seen[b]) { g_qs_seen[b] = true; g_qs_hash[b] = h; return; }
-            if (h == g_qs_hash[b]) {
-                if (g_qs_moving && now - g_qs_last_change > UINT64_C(3000000000)) { g_qs_moving = false; QsSave(b, "still"); }
+        /* the quick settings panel: is it showing? An 8 KB block in its
+         * middle (x 1040-1055, y 256-383) has pixels while it is open and none
+         * once it closed (ovl4). While it shows, the whole panel is copied
+         * five times a second, a block row at a time, from the buffer whose
+         * block was just read - and kept only if that block reads the same
+         * after the copy (overlayDisp was not drawing into it meanwhile). */
+        constinit u64 g_qs_next_ns = 0;
+        constinit u32 g_qs_copies = 0;
+        void StepQs(u32 b) {
+            constexpr size_t Probe = (2 * 80 + 65) * BlockBytes;   /* block row 2, GOB column 65 */
+            u8 *in = g_cached + CachedTeslaIn;
+            const u64 buf = g_od.base + b * OdBufBytes;
+            if (!DbgRead(g_od.h, in, buf + Probe, BlockBytes)) { return; }
+            bool shows = false;
+            for (u32 i = 3; i < BlockBytes; i += 4) { if (in[i] != 0) { shows = true; break; } }
+            if (!shows) {
+                if (g_qs_active.load(std::memory_order_relaxed)) {
+                    g_qs_active.store(false, std::memory_order_relaxed);
+                    g_qs_pub.store(0, std::memory_order_relaxed);
+                    LogLine("overlays: the quick settings closed");
+                }
                 return;
             }
-            g_qs_hash[b] = h;
-            u32 shown = 0, left = 40;
-            for (u32 col = 0; col < 40; ++col) {
-                const u8 *blk = r + col * BlockBytes;
-                bool any = false;
-                for (u32 i = 3; i < BlockBytes; i += 4) { if (blk[i] != 0) { ++shown; any = true; } }
-                if (any && col < left) { left = col; }
+            const u64 now = NowNs();
+            if (g_qs_active.load(std::memory_order_relaxed) && now < g_qs_next_ns) { return; }
+            const u32 before = Fnv(in, BlockBytes);
+            if (!g_qs_active.load(std::memory_order_relaxed)) {
+                /* it takes the big buffers from Tesla */
+                g_qs_active.store(true, std::memory_order_relaxed);
+                g_qs_pub.store(0, std::memory_order_relaxed);
+                g_tesla_pub.store(0, std::memory_order_relaxed);
+                LogLine("overlays: the quick settings opened");
             }
-            LogLine("overlays/qs: buffer %u, right half of rows 256-383 changed: %u%% shows, from x=%u", b,
-                    static_cast<u32>(shown * 100 / (40 * BlockBytes / 4)), left < 40 ? 640 + left * 16 : 0u);
-            if (!g_qs_moving) { QsSave(b, "start"); }
-            g_qs_moving = true;
-            g_qs_last_change = now;
+            const u32 pub = g_qs_pub.load(std::memory_order_relaxed);
+            const u32 di = (pub & 2) ? ((pub & 1) ^ 1) : 0;
+            u8 *dst = g_area + OffBig[di];
+            for (u32 r = 0; r < 6; ++r) {
+                if (!DbgRead(g_od.h, in, buf + (r * 80 + QsCol0) * BlockBytes, QsRow)) { return; }
+                static_cast<void>(Unpremultiply(in, QsRow));
+                std::memcpy(dst + r * QsRow, in, QsRow);
+                Pump(g_od);
+            }
+            if (!DbgRead(g_od.h, in, buf + Probe, BlockBytes) || Fnv(in, BlockBytes) != before) { return; }   /* drawn meanwhile: next time */
+            armDCacheFlush(dst, BigBuf);
+            g_qs_pub.store(di | 2u, std::memory_order_release);
+            g_qs_next_ns = now + UINT64_C(200000000);
+            ++g_qs_copies;
         }
 
         /* Tesla: while it presents, its last queued buffer 10 times a second */
@@ -360,11 +362,12 @@ namespace ams::mitm::applet {
                 return;
             }
             if (age > TeslaHoldNs) { return; }
+            if (g_qs_active.load(std::memory_order_relaxed)) { g_tesla_held_valid[0] = g_tesla_held_valid[1] = false; return; }   /* the panel has the buffers */
             const u64 now = NowNs();
             if (now < g_tesla_next_ns) { return; }
-            /* 30 looks a second while the menu is moving (someone navigates
-             * it), 10 while it sits still */
-            g_tesla_next_ns = now + (now < g_tesla_busy_until ? UINT64_C(33000000) : UINT64_C(100000000));
+            /* 20 looks a second while the menu is moving (someone navigates
+             * it, or Horizon OC's live numbers), 10 while it sits still */
+            g_tesla_next_ns = now + (now < g_tesla_busy_until ? UINT64_C(50000000) : UINT64_C(100000000));
             const u32 gen = g_tesla_buffers_gen.load(std::memory_order_relaxed);
             if (g_tesla.h != svc::InvalidHandle && gen != g_tesla_gen_seen) { g_tesla.base = 0; g_tesla_held_valid[0] = g_tesla_held_valid[1] = false; }   /* new buffers: find them again */
             g_tesla_gen_seen = gen;
@@ -395,7 +398,7 @@ namespace ams::mitm::applet {
             if ((pub & 2) && h == g_tesla_hash) { return; }
             g_tesla_busy_until = now + UINT64_C(1000000000);
             const u32 di = (pub & 2) ? ((pub & 1) ^ 1) : 0;
-            u8 *dst = g_area + OffTesla[di];
+            u8 *dst = g_area + OffBig[di];
             for (u32 r = 0; r < 6; ++r) {
                 if (g_tesla_held_valid[di] && g_tesla_held[di][r] == rh[r]) { continue; }   /* that buffer has this strip already */
                 ConvertTeslaRow(in + r * TeslaSrcRow, out);
@@ -412,6 +415,7 @@ namespace ams::mitm::applet {
 
         void OverlayThread(void *) {
             for (u32 a = 1; a < 256; ++a) { g_inv[a] = (255u << 16) / a; }
+            bool tables = false;
             for (u32 y = 0; y < 8; ++y) {
                 for (u32 x = 0; x < 32; ++x) { g_src_off[y][x] = static_cast<u16>(GobOffset(x * 2, y)); }
                 for (u32 x = 0; x < 16; ++x) { g_dst_off[y][x] = static_cast<u16>(GobOffset(x * 4, y)); }
@@ -429,23 +433,35 @@ namespace ams::mitm::applet {
                     if (!g_area_up.load(std::memory_order_relaxed) || !g_calibrated.load(std::memory_order_relaxed)) {
                         if (g_od.h != svc::InvalidHandle) { Detach(g_od, "not streaming"); }
                         if (g_tesla.h != svc::InvalidHandle) { Detach(g_tesla, "not streaming"); }
+                        tables = false;
                         continue;
+                    }
+                    if (!tables) {
+                        /* c * 255 / a for 4-bit c and a (the cached memory is new with each engine setup) */
+                        u16 *rg = reinterpret_cast<u16 *>(g_cached + CachedLutRg);
+                        u8 *bl = g_cached + CachedLutB;
+                        for (u32 a4 = 1; a4 < 16; ++a4) {
+                            auto un = [a4](u32 c4) -> u32 { const u32 v = c4 * 255 / a4; return v > 255 ? 255 : v; };
+                            for (u32 v = 0; v < 256; ++v) { rg[a4 * 256 + v] = static_cast<u16>(un(v & 15) | (un(v >> 4) << 8)); }
+                            for (u32 v = 0; v < 16; ++v) { bl[a4 * 16 + v] = static_cast<u8>(un(v)); }
+                        }
+                        tables = true;
                     }
                     const u64 t0 = NowNs();
                     if ((tick % 10) == 0) {
                         StepBar();
-                        if (g_qs_probe && g_od.h != svc::InvalidHandle) { StepQsProbe(g_bar_turn & 1); }
+                        if (g_od.h != svc::InvalidHandle) { StepQs(g_bar_turn & 1); }
                     }
                     StepTesla();   /* it keeps its own pace */
                     g_work_ns += NowNs() - t0;
                 }
                 if (NowNs() >= minute) {
                     minute = NowNs() + UINT64_C(60000000000);
-                    if (g_bar_copies != 0 || g_tesla_frames != 0) {
-                        LogLine("overlays: last minute - volume bar copied %u times, Tesla %u frames (%u of their 128-row strips converted), %llu ms of work",
-                                g_bar_copies, g_tesla_frames, g_tesla_rows, static_cast<unsigned long long>(g_work_ns / 1000000));
+                    if (g_bar_copies != 0 || g_tesla_frames != 0 || g_qs_copies != 0) {
+                        LogLine("overlays: last minute - volume bar copied %u times, quick settings %u, Tesla %u frames (%u of their 128-row strips converted), %llu ms of work",
+                                g_bar_copies, g_qs_copies, g_tesla_frames, g_tesla_rows, static_cast<unsigned long long>(g_work_ns / 1000000));
                     }
-                    g_bar_copies = g_tesla_frames = g_tesla_rows = 0;
+                    g_bar_copies = g_tesla_frames = g_tesla_rows = g_qs_copies = 0;
                     g_work_ns = 0;
                 }
             }
@@ -459,8 +475,6 @@ namespace ams::mitm::applet {
         if (g_armed || probe) { g_ovl_vi_mitm.store(true, std::memory_order_relaxed); }
         if (g_armed) {
             LogLine("overlays: on (overlays.txt) - the volume bar and Tesla/Ultrahand in the stream; Tesla's new vi:m sessions are wrapped (never captured)");
-            g_qs_probe = FileThere(QsProbeFile);
-            if (g_qs_probe) { LogLine("overlays/qs: on (probe-qs.txt) - the quick settings panel's pixels are watched and saved"); }
             SFT_ABORT_UNLESS(os::CreateThread(std::addressof(g_ovl_thread), OverlayThread, nullptr, g_ovl_stack, sizeof(g_ovl_stack), os::GetThreadPriority(os::GetCurrentThread())));
             os::SetThreadNamePointer(std::addressof(g_ovl_thread), "applet-mitm.Overlays");
             os::StartThread(std::addressof(g_ovl_thread));
@@ -487,6 +501,8 @@ namespace ams::mitm::applet {
         g_tesla_pub.store(0, std::memory_order_relaxed);
         g_bar_change_tick.store(0, std::memory_order_relaxed);
         g_tesla_held_valid[0] = g_tesla_held_valid[1] = false;
+        g_qs_pub.store(0, std::memory_order_relaxed);
+        g_qs_active.store(false, std::memory_order_relaxed);
         g_area_up.store(true, std::memory_order_release);
     }
 
@@ -498,6 +514,8 @@ namespace ams::mitm::applet {
         g_area_dev.store(0, std::memory_order_relaxed);
         g_bar_pub.store(0, std::memory_order_relaxed);
         g_tesla_pub.store(0, std::memory_order_relaxed);
+        g_qs_pub.store(0, std::memory_order_relaxed);
+        g_qs_active.store(false, std::memory_order_relaxed);
     }
 
     u32 OverlayPlanes(OverlayPlane *out, u32 max) {
@@ -505,9 +523,14 @@ namespace ams::mitm::applet {
         const u32 dev = g_area_dev.load(std::memory_order_relaxed);
         if (dev == 0) { return 0; }
         u32 n = 0;
+        const u32 qp = g_qs_pub.load(std::memory_order_acquire);
         const u32 tp = g_tesla_pub.load(std::memory_order_acquire);
-        if (n < max && (tp & 2) && AgoNs(g_tesla_present_tick.load(std::memory_order_relaxed)) < TeslaHoldNs) {
-            out[n++] = { dev + static_cast<u32>(OffTesla[tp & 1]), TeslaW, TeslaH, vic::PIXFMT_A8R8G8B8, 0, 0 };
+        if (n < max && g_qs_active.load(std::memory_order_relaxed) && (qp & 2)) {
+            out[n++] = { dev + static_cast<u32>(OffBig[qp & 1]), QsW, QsH, vic::PIXFMT_A8R8G8B8, QsX, 0 };
+            static bool said = false;
+            if (!said) { said = true; LogLine("overlays: the quick settings are in the stream (first frame)"); }
+        } else if (n < max && (tp & 2) && AgoNs(g_tesla_present_tick.load(std::memory_order_relaxed)) < TeslaHoldNs) {
+            out[n++] = { dev + static_cast<u32>(OffBig[tp & 1]), TeslaW, TeslaH, vic::PIXFMT_A8R8G8B8, 0, 0 };
             static bool said = false;
             if (!said) { said = true; LogLine("overlays: Tesla is in the stream (first frame)"); }
         }
