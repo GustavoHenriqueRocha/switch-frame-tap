@@ -6,8 +6,8 @@ make every game behave as if it allows video recording, so the console's own
 recorder runs for games that turn it off (Super Smash Bros. Ultimate) and their
 sound reaches Switch Frame Tap through grc:d.
 
-- Version: release `fw-22.5` (tag commit `5f7087fe03d5f42a425d3040d5cace3a42f68e81`),
-  one `.ips` per `am` build id, firmware 11.0 to 22.5.
+- Version: release `fw-23.0.1` (tag commit `3aa2977c2b58c0e385830b710f0af3b5c0bae36f`),
+  one `.ips` per `am` build id, firmware 11.0 to 23.0.1.
 - The release zip ships them **off**, in `config/switch-frame-tap/dvr-patches/`,
   where Atmosphère does not look. "Sound in no-record games" in the manager app
   or the overlay copies them to `atmosphere/exefs_patches/switch-frame-tap-sound/`
