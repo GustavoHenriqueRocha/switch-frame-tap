@@ -15,9 +15,9 @@
  *     content alone cannot say it is gone - probe 2).
  *   - the quick settings panel (hold HOME) is overlayDisp's too: x 816-1279,
  *     the full height, and its pixels clear when it closes (the probe, ovl4) -
- *     shown while they are there, copied five times a second.
- *   - a full-screen one (the power menu: hold POWER) - copied at half size
- *     three times a second (a whole buffer does not fit the area).
+ *     shown while they are there, looked at 20 times a second.
+ *   - a full-screen one (the power menu: hold POWER) - the same, kept at
+ *     half size (a whole buffer does not fit the area).
  *   - Tesla / Ultrahand (nx-ovlloader) draws 2 x 448x720 RGBA4444 (1344 KB,
  *     premultiplied). Its presents come through vi:m (wrapped while this is
  *     on); while it presents, the buffer it last queued is looked at 10 times
@@ -35,8 +35,9 @@
  * cached memory (the upper 1 MB of the dmnt:cht bounce); only finished
  * pixels are copied in. overlayDisp has no "frame done" signal: a read that
  * overlapped its drawing gave a torn notification (ovl3b, a dotted icon over
- * the previous picture), so a corner is taken only when two reads in a row
- * agree.
+ * the previous picture), so a picture is taken only when a second read 5 ms
+ * after the first agrees (reads right after each other can both land in the
+ * middle of its drawing - ovl7).
  * No floats are formatted (a stratosphere module has no newlib heap).
  */
 #include <stratosphere.hpp>
@@ -273,9 +274,12 @@ namespace ams::mitm::applet {
         constinit u32 g_bar_copies = 0, g_tesla_frames = 0;
         constinit u64 g_work_ns = 0;
 
+        constexpr u64 SettleMs = 5;   /* see Panel */
+
         /* the volume bar: one buffer's corner a tick (they alternate). When it
-         * differs from the last look it is read again: two reads that agree
-         * are a finished picture (not one being drawn) - copied in */
+         * differs from the last look it is read again SettleMs later: two
+         * reads that agree are a finished picture (not one being drawn) -
+         * copied in */
         constinit u32 g_bar_hash[2] = {}, g_bar_turn = 0;
         constinit bool g_bar_seen[2] = {};
         void StepBar() {
@@ -291,6 +295,8 @@ namespace ams::mitm::applet {
             if (!g_bar_seen[b]) { g_bar_seen[b] = true; g_bar_hash[b] = h; return; }   /* the first look is not a change */
             if (h == g_bar_hash[b]) { return; }
             const u32 pub = g_bar_pub.load(std::memory_order_relaxed);
+            Pump(g_od);
+            os::SleepThread(TimeSpan::FromMilliSeconds(SettleMs));
             if (!DbgRead(g_od.h, r0, va, BarBytes)) { Detach(g_od, "read failed"); return; }
             if (Fnv(r0, BarBytes) != h) {
                 /* being drawn: it still changes, so what shows stays up */
@@ -352,106 +358,104 @@ namespace ams::mitm::applet {
             }
         }
 
+        /* a quick check of a read: four 64-bit lanes, so the multiplies
+         * overlap (the panels hash 1.4-3.75 MB a look) */
+        u64 Hash64(const u8 *p, size_t n) {
+            const u64 *w = reinterpret_cast<const u64 *>(p);
+            constexpr u64 K = UINT64_C(0x9E3779B97F4A7C15);
+            u64 a = 1, b = 2, c = 3, d = 4;
+            for (size_t i = 0; i + 4 <= n / 8; i += 4) {
+                a = (a ^ w[i]) * K;
+                b = (b ^ w[i + 1]) * K;
+                c = (c ^ w[i + 2]) * K;
+                d = (d ^ w[i + 3]) * K;
+            }
+            return a ^ ((b << 16) | (b >> 48)) ^ ((c << 32) | (c >> 32)) ^ ((d << 48) | (d >> 16));
+        }
+
+        /* SettleMs: how long a picture must stay put before it is taken.
+         * overlayDisp has no "frame done" signal, and a strip it is drawing
+         * can read the same twice in a row: ovl7 read each strip again at
+         * once (0.1 ms later) and showed dashed text and coloured streaks;
+         * ovl6, whose second read came ~5 ms after the first, showed none */
+
         /* a panel of overlayDisp's that fills one of the big buffers: the
          * quick settings (x 816-1279, copied as is) or a full-screen one (the
-         * power menu, halved). It redraws all the time (a highlight pulses),
-         * and ovl6 - a whole copy, then a whole second read to check it - lost
-         * more than half its copies to redraws (40 of 72) and managed about
-         * two a second: it looked laggy next to Tesla. Now, 20 times a second:
-         * one 8 KB GOB column of each 128-row strip says which strips changed
-         * (plus all of them once a second); only those are read, each read
-         * again at once to check it (up to three tries - a strip read is
-         * short, so a redraw rarely falls in between), and written into our
-         * buffer that is not shown, with every strip it is missing. */
+         * power menu, halved). It redraws all the time (a highlight pulses).
+         * 20 looks a second, each reading the whole panel from one of
+         * overlayDisp's buffers (1.4 MB, or 3.75 MB for the full screen -
+         * reads run at ~1.7 GB/s, the ovl2 probe) and hashing it by 128-row
+         * strips. A strip that differs from what shows means a new picture or
+         * one being drawn: the panel is read again SettleMs later, and only if
+         * every strip still reads the same is it written - the strips our
+         * hidden buffer does not hold yet - and shown. If it moved, the other
+         * buffer is tried: the one being drawn is not the one on screen. */
         struct Panel {
             const char *name;
-            u32 col0, cols, sample_col;              /* GOB columns of an overlayDisp buffer */
+            u32 col0, cols;                          /* GOB columns of an overlayDisp buffer */
             bool half;                               /* the full screen at half size */
             std::atomic<u32> *pub;
             std::atomic<bool> *active;
             u32 turn;                                /* the overlayDisp buffer looked at next */
-            u32 sample[2][6];                        /* per overlayDisp buffer: each strip's sample hash */
-            u32 cur[6];                              /* each strip's hash, last read */
-            u32 held[2][6];                          /* per buffer of ours: which strip it holds */
+            u64 held[2][6];                          /* per buffer of ours: each strip's hash */
             bool held_valid[2];
-            u64 next_full_ns;
             u32 copies, torn;
         };
-        constinit Panel g_qs = { "the quick settings", QsCol0, QsCols, 65, false, &g_qs_pub, &g_qs_active, 0, {}, {}, {}, {}, 0, 0, 0 };
-        constinit Panel g_fs = { "a full-screen one (the power menu?)", 0, 80, 40, true, &g_fs_pub, &g_fs_active, 0, {}, {}, {}, {}, 0, 0, 0 };
+        constinit Panel g_qs = { "the quick settings", QsCol0, QsCols, false, &g_qs_pub, &g_qs_active, 0, {}, {}, 0, 0 };
+        constinit Panel g_fs = { "a full-screen one (the power menu?)", 0, 80, true, &g_fs_pub, &g_fs_active, 0, {}, {}, 0, 0 };
 
         void PanelReset(Panel &p) {
             p.pub->store(0, std::memory_order_relaxed);
             p.held_valid[0] = p.held_valid[1] = false;
-            for (u32 b = 0; b < 2; ++b) { for (u32 r = 0; r < 6; ++r) { p.sample[b][r] = 0; } }
-            p.next_full_ns = 0;
         }
 
-        /* one look: true once the panel is in a buffer of ours */
-        void PanelStep(Panel &p) {
-            const u32 b = (p.turn++) & 1;
+        enum class Look { Same, Copied, Moving, Failed };
+
+        /* overlayDisp's buffer b: is there a new picture, and has it settled? */
+        Look PanelTry(Panel &p, u32 b) {
             const u64 buf = g_od.base + b * OdBufBytes;
-            const u64 now = NowNs();
             u8 *in = g_cached + CachedTeslaIn;
             const size_t row_bytes = p.cols * BlockBytes;
-            bool changed = false;
-            const bool full = now >= p.next_full_ns;
-            if (full) { p.next_full_ns = now + UINT64_C(1000000000); }
-            bool stale[6];
-            for (u32 r = 0; r < 6; ++r) {
-                u8 *sp = g_cached + CachedTeslaOut;
-                if (!DbgRead(g_od.h, sp, buf + (r * 80 + p.sample_col) * BlockBytes, BlockBytes)) { return; }
-                const u32 sh = Fnv(sp, BlockBytes);
-                stale[r] = full || sh != p.sample[b][r];
-                p.sample[b][r] = sh;
-            }
-            /* the strips that changed: read, checked, their hash noted */
             const u32 pub = p.pub->load(std::memory_order_relaxed);
-            const u32 di = (pub & 2) ? ((pub & 1) ^ 1) : 0;
+            const bool shown = (pub & 2) != 0;
+            const u32 si = pub & 1;
+            u64 h1[6];
+            bool same = shown;
+            for (u32 r = 0; r < 6; ++r) {
+                if (!DbgRead(g_od.h, in, buf + (r * 80 + p.col0) * BlockBytes, row_bytes)) { return Look::Failed; }
+                h1[r] = Hash64(in, row_bytes);
+                if (p.held[si][r] != h1[r]) { same = false; }
+            }
+            if (same) { return Look::Same; }
+            Pump(g_od);
+            os::SleepThread(TimeSpan::FromMilliSeconds(SettleMs));
+            Pump(g_od);
+            /* every strip again, in the same order: each read the same across
+             * the wait, so the copy is the buffer as it was during it */
+            const u32 di = shown ? (si ^ 1) : 0;
             u8 *dst = g_area + OffBig[di];
             for (u32 r = 0; r < 6; ++r) {
-                const bool need = stale[r] || !p.held_valid[di] || p.held[di][r] != p.cur[r];
-                if (!need) { continue; }
-                const u64 src = buf + (r * 80 + p.col0) * BlockBytes;
-                u32 h = 0;
-                bool ok = false;
-                if (!DbgRead(g_od.h, in, src, row_bytes)) { return; }
-                h = Fnv(in, row_bytes);
-                for (u32 t = 0; t < 3 && !ok; ++t) {
-                    /* a second read into the converted-row scratch: same bytes = not being drawn */
-                    u8 *chk = g_cached + CachedTeslaOut;
-                    u32 h2 = 2166136261u;
-                    for (size_t off = 0; off < row_bytes; off += TeslaDstRow) {
-                        const size_t n = row_bytes - off < TeslaDstRow ? row_bytes - off : TeslaDstRow;
-                        if (!DbgRead(g_od.h, chk, src + off, n)) { return; }
-                        h2 = (h2 ^ Fnv(chk, n)) * 16777619u;
-                    }
-                    u32 h1 = 2166136261u;
-                    for (size_t off = 0; off < row_bytes; off += TeslaDstRow) {
-                        const size_t n = row_bytes - off < TeslaDstRow ? row_bytes - off : TeslaDstRow;
-                        h1 = (h1 ^ Fnv(in + off, n)) * 16777619u;
-                    }
-                    if (h1 == h2) { ok = true; break; }
-                    ++p.torn;
-                    if (!DbgRead(g_od.h, in, src, row_bytes)) { return; }
-                    h = Fnv(in, row_bytes);
-                }
-                if (!ok) { return; }   /* still being drawn: next look */
-                if (h != p.cur[r]) { changed = true; }
-                p.cur[r] = h;
+                if (!DbgRead(g_od.h, in, buf + (r * 80 + p.col0) * BlockBytes, row_bytes)) { return Look::Failed; }
+                const u64 h = Hash64(in, row_bytes);
+                if (h != h1[r]) { ++p.torn; return Look::Moving; }
+                if (p.held_valid[di] && p.held[di][r] == h) { continue; }   /* that buffer has this strip already */
                 if (p.half) { HalveRow(in, r, dst); }
                 else {
                     static_cast<void>(Unpremultiply(in, row_bytes));
                     std::memcpy(dst + r * row_bytes, in, row_bytes);
                 }
                 p.held[di][r] = h;
-                Pump(g_od);
             }
-            p.held_valid[di] = true;   /* every strip of it is current now */
-            if (!changed && p.held_valid[di ^ 1] && (pub & 2)) { return; }   /* what shows is current too */
+            p.held_valid[di] = true;
             armDCacheFlush(dst, BigBuf);
             p.pub->store(di | 2u, std::memory_order_release);
             ++p.copies;
+            return Look::Copied;
+        }
+
+        void PanelStep(Panel &p) {
+            const u32 b = (p.turn++) & 1;
+            if (PanelTry(p, b) == Look::Moving) { static_cast<void>(PanelTry(p, b ^ 1)); }
         }
 
         /* is the panel there? (the sample blocks of buffer turn & 1) */
@@ -598,7 +602,7 @@ namespace ams::mitm::applet {
                 if (NowNs() >= minute) {
                     minute = NowNs() + UINT64_C(60000000000);
                     if (g_bar_copies != 0 || g_tesla_frames != 0 || g_qs.copies != 0 || g_fs.copies != 0) {
-                        LogLine("overlays: last minute - volume bar copied %u times, quick settings %u (%u strip reads redone), full-screen %u (%u), Tesla %u frames (%u of their 128-row strips converted), %llu ms of work",
+                        LogLine("overlays: last minute - volume bar copied %u times, quick settings %u (%u looks caught it being drawn), full-screen %u (%u), Tesla %u frames (%u of their 128-row strips converted), %llu ms of work",
                                 g_bar_copies, g_qs.copies, g_qs.torn, g_fs.copies, g_fs.torn, g_tesla_frames, g_tesla_rows, static_cast<unsigned long long>(g_work_ns / 1000000));
                     }
                     g_bar_copies = g_tesla_frames = g_tesla_rows = 0;
