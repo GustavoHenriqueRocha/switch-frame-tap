@@ -3262,7 +3262,7 @@ namespace ams::mitm::applet {
             g_live_fps_x10.store(0, std::memory_order_relaxed);
             g_live_game_fps_x10.store(0, std::memory_order_relaxed);
             static const char *const names[] = { "done", "a game is on screen", "the viewer went away", "NVENC stalled", "failed",
-                                                 "restarting (new settings or a game's new buffers)", "turned off from the overlay" };
+                                                 "restarting (new settings or a game's new buffers)", "turned off, or an applet needs the memory" };
             LogLine("   live[%u]: HOME-menu session ended - %s; detached from vi", sessions, names[static_cast<int>(end)]);
             if (end == StreamEnd::Failed) { os::SleepThread(TimeSpan::FromSeconds(5)); }
             return true;
@@ -3478,6 +3478,10 @@ namespace ams::mitm::applet {
                                                      "the picture size changed - restarting at the new size", "turned off from the overlay" };
                 LogLine("   live[%u]: session ended - %s; detached", sessions, names[static_cast<int>(end)]);
                 if (end == StreamEnd::Failed) { os::SleepThread(TimeSpan::FromSeconds(5)); }
+                /* v0.7.14: with the HOME menu streaming, its session follows a
+                 * game's at once - the 1 s pause was most of the 1.35 s the
+                 * viewer stood still when a game was quit (ovl3d) */
+                else if (end == StreamEnd::GameGone && g_ui_stream_armed) { os::SleepThread(TimeSpan::FromMilliSeconds(300)); }
                 else if (end != StreamEnd::Reconfigure && end != StreamEnd::Disabled) { os::SleepThread(TimeSpan::FromSeconds(1)); }
                 else if (end == StreamEnd::Reconfigure) { os::SleepThread(TimeSpan::FromMilliSeconds(300)); }   /* a new buffer set registers slot by slot */
             }

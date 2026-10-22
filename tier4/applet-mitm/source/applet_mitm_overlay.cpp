@@ -157,22 +157,29 @@ namespace ams::mitm::applet {
                 static_cast<void>(DbgResume(p.h, std::addressof(n)));
             }
         }
-        /* the device-shared region of exactly `size` bytes */
-        u64 FindRegion(svc::Handle h, u64 size) {
+        /* the device-shared region of exactly `size` bytes (log: say what there is) */
+        u64 FindRegion(svc::Handle h, u64 size, const char *log = nullptr) {
             u64 addr = 0;
             for (u32 guard = 0; guard < 4096; ++guard) {
                 svc::MemoryInfo mi = {};
                 svc::PageInfo pi = {};
                 if (!DbgQuery(h, std::addressof(mi), std::addressof(pi), addr) || mi.size == 0) { break; }
                 const bool dev = (static_cast<u32>(mi.attribute) & svc::MemoryAttribute_DeviceShared) != 0 || mi.device_count != 0;
-                if (dev && mi.size == size && (mi.permission & svc::MemoryPermission_Read) != 0) { return mi.base_address; }
+                if (dev && log != nullptr) {
+                    LogLine("overlays: %s device-shared %010llx %llu KB state 0x%x perm %u dev %u", log, static_cast<unsigned long long>(mi.base_address),
+                            static_cast<unsigned long long>(mi.size / 1024), static_cast<u32>(mi.state), static_cast<u32>(mi.permission), mi.device_count);
+                }
+                if (dev && mi.size == size && (mi.permission & svc::MemoryPermission_Read) != 0 && log == nullptr) { return mi.base_address; }
                 const u64 next = mi.base_address + mi.size;
                 if (next <= addr) { break; }
                 addr = next;
             }
             return 0;
         }
-        bool Attach(Proc &p, u64 program, u64 region) {
+        /* keep: stay attached without the region (Tesla makes its buffers as it
+         * opens - ovl3d found none 0.3 s in, detached and waited 5 s, and a
+         * menu opened and closed within that never showed) */
+        bool Attach(Proc &p, u64 program, u64 region, bool keep = false) {
             if (p.h != svc::InvalidHandle) { return true; }
             if (NowNs() < p.retry_at) { return false; }
             p.retry_at = NowNs() + UINT64_C(5000000000);
@@ -188,7 +195,8 @@ namespace ams::mitm::applet {
             p.h = h;
             p.base = FindRegion(h, region);
             if (p.base == 0) {
-                LogLine("overlays: %s (pid %llu) - no %llu KB region", p.name, static_cast<unsigned long long>(pid), static_cast<unsigned long long>(region / 1024));
+                LogLine("overlays: %s (pid %llu) - no %llu KB region yet", p.name, static_cast<unsigned long long>(pid), static_cast<unsigned long long>(region / 1024));
+                if (keep) { return true; }
                 Detach(p, "no frame buffers");
                 return false;
             }
@@ -281,6 +289,7 @@ namespace ams::mitm::applet {
         /* Tesla: while it presents, its last queued buffer 10 times a second */
         constinit u32 g_tesla_gen_seen = 0, g_tesla_hash = 0;
         constinit u64 g_tesla_next_ns = 0, g_tesla_busy_until = 0;
+        constinit u32 g_tesla_misses = 0;
         void StepTesla() {
             const u64 age = AgoNs(g_tesla_present_tick.load(std::memory_order_relaxed));
             if (age > UINT64_C(2000000000)) {
@@ -295,19 +304,25 @@ namespace ams::mitm::applet {
              * it), 10 while it sits still */
             g_tesla_next_ns = now + (now < g_tesla_busy_until ? UINT64_C(33000000) : UINT64_C(100000000));
             const u32 gen = g_tesla_buffers_gen.load(std::memory_order_relaxed);
-            if (g_tesla.h != svc::InvalidHandle && gen != g_tesla_gen_seen) {
-                /* new buffers: find them again */
-                g_tesla.base = FindRegion(g_tesla.h, TeslaRegion);
-                if (g_tesla.base == 0) { Detach(g_tesla, "its buffers moved out of reach"); }
-            }
+            if (g_tesla.h != svc::InvalidHandle && gen != g_tesla_gen_seen) { g_tesla.base = 0; }   /* new buffers: find them again */
             g_tesla_gen_seen = gen;
-            if (g_tesla.h == svc::InvalidHandle && !Attach(g_tesla, TeslaProgramId, TeslaRegion)) { return; }
+            if (g_tesla.h == svc::InvalidHandle && !Attach(g_tesla, TeslaProgramId, TeslaRegion, true)) { return; }
+            if (g_tesla.base == 0) {
+                /* looked for again every look while it presents */
+                g_tesla.base = FindRegion(g_tesla.h, TeslaRegion);
+                if (g_tesla.base == 0) {
+                    if (++g_tesla_misses == 10) { static_cast<void>(FindRegion(g_tesla.h, TeslaRegion, "Tesla (no 1344 KB region after 10 looks)")); }
+                    return;
+                }
+                if (g_tesla_misses != 0) { LogLine("overlays: Tesla frame buffers at %010llx after %u look(s)", static_cast<unsigned long long>(g_tesla.base), g_tesla_misses); }
+                g_tesla_misses = 0;
+            }
             const u32 slot = g_tesla_slot.load(std::memory_order_relaxed) & 1;
             const u64 src = g_tesla.base + slot * TeslaSrcBuf;
             u8 *in = g_cached + CachedTeslaIn, *out = g_cached + CachedTeslaOut;
             /* a menu sits still most of the time: one read, and a conversion
              * only when the picture changed */
-            if (!DbgRead(g_tesla.h, in, src, TeslaSrcBuf)) { Detach(g_tesla, "read failed"); return; }
+            if (!DbgRead(g_tesla.h, in, src, TeslaSrcBuf)) { g_tesla.base = 0; return; }   /* its buffers went: find the new ones */
             Pump(g_tesla);
             const u32 h = Fnv(in, TeslaSrcBuf);
             const u32 pub = g_tesla_pub.load(std::memory_order_relaxed);
