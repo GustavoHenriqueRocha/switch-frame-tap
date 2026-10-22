@@ -24,6 +24,9 @@ namespace ams::mitm::applet {
 
     extern bool g_net_armed;                     /* "net": the network transport is on */
     extern std::atomic<bool> g_tx_net;           /* this stream goes to the network client */
+    /* exp/net-ethernet: nifm reports Ethernet (dock wired). Wired streams
+     * may use a shorter keyframe cadence than Wi-Fi. */
+    extern std::atomic<bool> g_net_wired;
 
     /* starts the network thread (waits for the console to be online) */
     void StartNet();

@@ -22,6 +22,7 @@ namespace ams::mitm::applet {
 
     constinit bool g_net_armed = false;
     constinit std::atomic<bool> g_tx_net{false};
+    constinit std::atomic<bool> g_net_wired{false};
 
     namespace {
 
@@ -29,7 +30,8 @@ namespace ams::mitm::applet {
         constexpr u16 BeaconPort = 9951;         /* "here I am" (UDP broadcast) */
 
         /* SysDVR's sizes: a 16 KB TCP send buffer that may grow to 200 KB.
-         * transfer memory = (tx max + rx + udp tx + udp rx) x efficiency */
+         * Kept at 200: a larger max grows the static socket tmem for every
+         * user (USB included), and system memory is tight. */
         constexpr u32 TcpTx = 16 * 1024, TcpTxMax = 200 * 1024, TcpRx = 8 * 1024;
         constexpr u32 UdpTx = 8 * 1024, UdpRx = 4 * 1024, Efficiency = 2;
         constexpr size_t TmemSize = ((TcpTxMax + TcpRx + UdpTx + UdpRx + 0xFFF) & ~size_t(0xFFF)) * Efficiency;
@@ -168,6 +170,20 @@ namespace ams::mitm::applet {
                     if (R_FAILED(nifmGetCurrentIpAddress(&ip))) { ip = 0; }
                 }
                 g_ip = ip;
+                if (ip != 0) {
+                    NifmInternetConnectionType ctype = NifmInternetConnectionType_WiFi;
+                    u32 bars = 0;
+                    NifmInternetConnectionStatus cstat = NifmInternetConnectionStatus_ConnectingUnknown1;
+                    const bool wired = R_SUCCEEDED(nifmGetInternetConnectionStatus(&ctype, &bars, &cstat))
+                                       && ctype == NifmInternetConnectionType_Ethernet;
+                    const bool was = g_net_wired.load(std::memory_order_relaxed);
+                    g_net_wired.store(wired, std::memory_order_relaxed);
+                    if (wired != was || ip != last_ip) {
+                        LogLine("net: link is %s", wired ? "Ethernet (wired)" : "Wi-Fi");
+                    }
+                } else {
+                    g_net_wired.store(false, std::memory_order_relaxed);
+                }
                 if (ip != last_ip) {
                     char s[20];
                     IpString(ip, s, sizeof(s));
@@ -227,8 +243,15 @@ namespace ams::mitm::applet {
                 char s[20];
                 IpString(g_client_ip, s, sizeof(s));
                 ++s_clients;
-                LogLine("net: viewer connected from %s", s);
-                g_viewer_can_ask.store(false, std::memory_order_relaxed);   /* until this viewer asks */
+                LogLine("net: viewer connected from %s (%s)", s,
+                        g_net_wired.load(std::memory_order_relaxed) ? "wired" : "wifi");
+                /* Mid-join: one IDR now so the viewer is not stuck on P-frame
+                 * garbage. Leave can_ask false until this viewer sends SFTK -
+                 * otherwise Android / older PC viewers would only get keyframes
+                 * every 240 frames on Wi-Fi. */
+                g_viewer_can_ask.store(false, std::memory_order_relaxed);
+                g_viewer_key_request.store(true, std::memory_order_relaxed);
+                LogLine("net: auto keyframe for new viewer");
                 g_client = c;
             }
         }

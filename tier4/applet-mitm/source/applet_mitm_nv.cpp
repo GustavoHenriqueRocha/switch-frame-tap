@@ -7608,14 +7608,18 @@ namespace ams::mitm::applet {
                 /* v0.7.13: the viewer asked for one (a new decoder, a recording
                  * starting). Over TCP nothing is lost, so a keyframe is only
                  * for such a start: to a viewer that asks, the network sends
-                 * one every 240 frames - each is up to ~20 P frames' worth,
-                 * and on a busy link it held the stream up ~0.2 s every second
-                 * (creeper3010, #7) - the P frames get those bits instead */
+                 * one every 240 frames on Wi-Fi - each is up to ~20 P frames'
+                 * worth, and on a busy link it held the stream up ~0.2 s every
+                 * second (creeper3010, #7) - the P frames get those bits instead.
+                 * exp/net-ethernet: wired uses 60 so mid-join / seek recovers
+                 * faster without the Wi-Fi stall risk. */
                 if (live && g_viewer_key_request.exchange(false, std::memory_order_relaxed)) { need_idr = true; ++key_requests; }
-                const u32 gop_now = (g_tx_net && gop != 0 && g_viewer_can_ask.load(std::memory_order_relaxed)) ? 240 : gop;
+                const u32 net_gop = g_net_wired.load(std::memory_order_relaxed) ? 60u : 240u;
+                const u32 gop_now = (g_tx_net && gop != 0 && g_viewer_can_ask.load(std::memory_order_relaxed)) ? net_gop : gop;
                 if (gop_now != gop && !said_long_gop) {
                     said_long_gop = true;
-                    LogLine("   nvstream: the network viewer asks for keyframes when it needs one - otherwise one every 240 frames (setting: %u)", gop);
+                    LogLine("   nvstream: network keyframes on demand + every %u frames (%s; setting: %u)",
+                            net_gop, g_net_wired.load(std::memory_order_relaxed) ? "wired" : "wifi", gop);
                 }
                 if (gop == 0 || need_idr || pos >= gop_now) { pos = 0; }
                 NvfJob j;
