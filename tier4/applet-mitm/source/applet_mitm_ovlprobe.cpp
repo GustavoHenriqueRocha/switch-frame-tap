@@ -1,24 +1,23 @@
 /*
- * v0.7.14 overlay probe 1: the overlays on top of a game - the system's
- * (overlayDisp, 010000000000100C: the volume bar, notifications) and Tesla /
- * Ultrahand's (nx-ovlloader, 420000000007E51A). Research only - off unless
- * sdmc:/config/switch-frame-tap/probe-ovl.txt exists, and left out of
+ * v0.7.14 overlay probe 2 (ovl2): what streaming the overlays would cost, and
+ * whether Tesla can be watched without stalling it. Research only - off
+ * unless sdmc:/config/switch-frame-tap/probe-ovl.txt exists, and left out of
  * release builds (SFT_OVL_PROBE).
  *
- * The stream copies the game's own frames, so what the console draws on top
- * never reaches it. Both overlay processes open their display connection at
- * boot, before this module, so their presents cannot be watched the way a
- * game's are; their pixels have to be found in their memory, as the HOME
- * menu's were in vi's. Known so far: overlayDisp has one 7680 KB region
- * mapped by two devices = 2 x 1280x768x4 (probe1 of the HOME-menu work);
- * libtesla draws a 448x720 RGBA4444 framebuffer, 2 buffers, through vi:m,
- * shown 672x1080 at the left edge.
- *
- * Every 30 s from 70 s after start, for each of the two processes that runs:
- * attach (the debug events pumped), list its device-shared regions, then for
- * 20 s hash each candidate region in 64 KB blocks every 200 ms and log which
- * blocks change per second; the first changes of a region (up to 3 per
- * region over the run) are saved whole to probe/ovl-<name>-<base>-<n>.bin.
+ * Probe 1 (logs/v0714-ovl1-run1, decoded/) found the pixels: overlayDisp draws
+ * the volume bar into a 7680 KB region (2 x 1280x720 RGBA8, block-linear,
+ * 16-GOB blocks, premultiplied alpha, all zero when hidden); Tesla draws into
+ * 2 x 448x720 RGBA4444 (1344 KB, premultiplied). It also found the costs it
+ * could not separate: the stream fell to 33-47 fps while it watched
+ * overlayDisp, and attaching to Tesla stalled Ultrahand. So, from `start=`
+ * seconds after start (probe-ovl.txt, default 360) in 75 s cycles:
+ *   overlayDisp, 15 s each: detached / attached reading 8 KB every 200 ms
+ *   (is the bar showing?) / plus 64 KB every 50 ms / plus 512 KB every 50 ms;
+ *   Tesla, 15 s: attached, debug events answered every 5 ms, its region
+ *   hashed every 500 ms.
+ * Every second: the stream's frames, read and VIC time, the probe's own read
+ * time and bytes, whether the bar showed, Tesla's vi:m transactions (its new
+ * sessions are wrapped with the probe on - counted, never captured).
  * No floats are formatted (a stratosphere module has no newlib heap).
  */
 #include <stratosphere.hpp>
@@ -26,38 +25,35 @@
 #include <cstring>
 #include "applet_mitm_log.hpp"
 #include "applet_mitm_dmdbg.hpp"
+#include "applet_mitm_nv.hpp"
+#include "applet_mitm_uibinder.hpp"
 #include "applet_mitm_ovlprobe.hpp"
 
 #if SFT_OVL_PROBE
 
 namespace ams::mitm::applet {
 
+    constinit std::atomic<bool> g_ovl_vi_mitm{false};
+
     namespace {
 
         constexpr const char *ProbeFile = "sdmc:/config/switch-frame-tap/probe-ovl.txt";
         constexpr const char *ProbeDir  = "sdmc:/config/switch-frame-tap/probe";
-
-        struct Target { u64 program; const char *name; };
-        constexpr Target Targets[] = {
-            { UINT64_C(0x010000000000100C), "overlayDisp" },
-            { UINT64_C(0x420000000007E51A), "tesla" },
-        };
+        constexpr u64 OverlayDispProgramId = UINT64_C(0x010000000000100C);
 
         constexpr size_t Block = 0x10000;              /* 64 KB hash blocks */
-        constexpr size_t MaxRegions = 8;
-        constexpr size_t MaxBlocks = 512;              /* 32 MB of candidates per process */
-        struct Region { u64 base; u64 size; u32 block0; u32 saved; u32 changes; };
-        constinit Region g_regs[MaxRegions];
-        constinit u32 g_nregs = 0;
-        constinit u32 g_hash[MaxBlocks];
-        constinit u32 g_saves[2][16];                  /* per target: saved snapshots by region index */
-
         constexpr size_t Chunk = 0x4000;
         alignas(0x1000) constinit u8 g_buf[Chunk];
+        constexpr u64 BarBufBytes = UINT64_C(1280) * 768 * 4;   /* one overlayDisp buffer */
+        constexpr u64 OdRegionBytes = 2 * BarBufBytes;           /* 7680 KB */
 
         alignas(os::ThreadStackAlignment) constinit u8 g_probe_stack[16_KB];
         constinit os::ThreadType g_probe_thread;
-        constinit u32 g_pumped = 0;
+
+        constinit std::atomic<u32> g_tesla_txns{0}, g_tesla_presents{0};
+        constinit u32 g_tesla_logged[16] = {};
+        constinit u32 g_saves = 0;
+        constinit u64 g_od_base_last = 0, g_tesla_base_last = 0;
 
         bool ProbeOn() {
             fs::FileHandle f;
@@ -65,6 +61,21 @@ namespace ams::mitm::applet {
             fs::CloseFile(f);
             return true;
         }
+        /* "start=N" in probe-ovl.txt: seconds after the module starts */
+        u32 StartDelay() {
+            char t[64] = {};
+            fs::FileHandle f;
+            if (R_FAILED(fs::OpenFile(std::addressof(f), ProbeFile, fs::OpenMode_Read))) { return 360; }
+            size_t n = 0;
+            static_cast<void>(fs::ReadFile(std::addressof(n), f, 0, t, sizeof(t) - 1));
+            fs::CloseFile(f);
+            const char *p = std::strstr(t, "start=");
+            if (p == nullptr) { return 360; }
+            u32 v = 0;
+            for (p += 6; *p >= '0' && *p <= '9'; ++p) { v = v * 10 + static_cast<u32>(*p - '0'); }
+            return v < 40 ? 40 : (v > 3600 ? 3600 : v);
+        }
+        u64 NowNs() { return armTicksToNs(armGetSystemTick()); }
         u64 PidOf(u64 program_id) {
             os::ProcessId pid{0};
             if (R_FAILED(::ams::pm::dmnt::GetProcessId(std::addressof(pid), ncm::ProgramId{program_id}))) { return 0; }
@@ -74,137 +85,267 @@ namespace ams::mitm::applet {
             for (size_t i = 0; i < n; i += 4) { h = (h ^ (p[i] | (p[i + 1] << 8) | (p[i + 2] << 16) | (static_cast<u32>(p[i + 3]) << 24))) * 16777619u; }
             return h;
         }
-        void Pump(svc::Handle h) {
+
+        /* the probe's own reads, timed */
+        struct Cost { u64 ns = 0, bytes = 0; };
+        bool Read(svc::Handle h, Cost &c, void *dst, u64 va, size_t len) {
+            const u64 t0 = NowNs();
+            const bool ok = DbgRead(h, dst, va, len);
+            c.ns += NowNs() - t0; c.bytes += len;
+            return ok;
+        }
+        /* answer pending debug events (a thread starting or ending stops the
+         * whole process until we do) */
+        struct Pumper { u32 events = 0; u64 last = 0, max_gap = 0; };
+        void Pump(svc::Handle h, Pumper &pm) {
+            const u64 now = NowNs();
+            if (pm.last != 0 && now - pm.last > pm.max_gap) { pm.max_gap = now - pm.last; }
+            pm.last = now;
             s32 idx = 0;
             if (R_SUCCEEDED(svc::WaitSynchronization(std::addressof(idx), std::addressof(h), 1, 0))) {
                 u32 n = 0;
                 static_cast<void>(DbgResume(h, std::addressof(n)));
-                ++g_pumped;
+                pm.events += n != 0 ? n : 1;
             }
         }
-        /* the hash of one 64 KB block, read in 16 KB pieces */
-        u32 HashBlock(svc::Handle h, u64 va, size_t len) {
-            u32 v = 2166136261u;
-            for (size_t off = 0; off < len; off += Chunk) {
-                const size_t n = len - off < Chunk ? len - off : Chunk;
-                if (!DbgRead(h, g_buf, va + off, n)) { return 0; }
-                v = Fnv(g_buf, n, v);
-            }
-            return v;
+
+        /* the stream's counters at the start of a second */
+        struct Sec { u32 f; u64 r, v; u32 tp; };
+        Sec SecNow() {
+            return { g_live_frames.load(std::memory_order_relaxed), g_live_read_ns.load(std::memory_order_relaxed),
+                     g_live_vic_ns.load(std::memory_order_relaxed), g_tesla_presents.load(std::memory_order_relaxed) };
         }
-        /* the device-shared regions that could hold frame buffers */
-        void Map(svc::Handle h, const char *name) {
-            g_nregs = 0;
-            u32 blocks = 0;
-            u64 addr = 0;
+        void SecLog(const char *tag, u32 sec, const Sec &s0, const Cost &c, int vis, const char *extra) {
+            const Sec s1 = SecNow();
+            const u32 fr = s1.f - s0.f;
+            LogLine("ovl2 %-11s %2u: %2u frames, read %4llu us, VIC %4llu us | probe %5llu us %5llu KB | bar %d | tesla vi %u%s",
+                    tag, sec, fr,
+                    static_cast<unsigned long long>(fr ? (s1.r - s0.r) / fr / 1000 : 0),
+                    static_cast<unsigned long long>(fr ? (s1.v - s0.v) / fr / 1000 : 0),
+                    static_cast<unsigned long long>(c.ns / 1000), static_cast<unsigned long long>(c.bytes / 1024),
+                    vis, s1.tp - s0.tp, extra);
+        }
+
+        /* the device-shared region of `size` bytes (or the largest above `min`) */
+        bool FindRegion(svc::Handle h, const char *name, u64 size, u64 min, u64 *out_base, u64 *out_size, bool log_all) {
+            u64 addr = 0, best = 0, best_size = 0;
             for (u32 guard = 0; guard < 4096; ++guard) {
                 svc::MemoryInfo mi = {};
                 svc::PageInfo pi = {};
                 if (!DbgQuery(h, std::addressof(mi), std::addressof(pi), addr) || mi.size == 0) { break; }
                 const bool dev = (static_cast<u32>(mi.attribute) & svc::MemoryAttribute_DeviceShared) != 0 || mi.device_count != 0;
                 if (dev && mi.state != svc::MemoryState_Io && (mi.permission & svc::MemoryPermission_Read) != 0) {
-                    LogLine("ovlprobe: %s device-shared %010llx %6llu KB state 0x%x perm %u attr 0x%x dev %u",
-                            name, static_cast<unsigned long long>(mi.base_address), static_cast<unsigned long long>(mi.size / 1024),
-                            static_cast<u32>(mi.state), static_cast<u32>(mi.permission), static_cast<u32>(mi.attribute), mi.device_count);
-                    const u32 nb = static_cast<u32>((mi.size + Block - 1) / Block);
-                    if (mi.size >= 256 * 1024 && g_nregs < MaxRegions && blocks + nb <= MaxBlocks) {
-                        g_regs[g_nregs++] = { mi.base_address, mi.size, blocks, 0, 0 };
-                        blocks += nb;
+                    if (log_all) {
+                        LogLine("ovl2: %s device-shared %010llx %6llu KB dev %u", name, static_cast<unsigned long long>(mi.base_address),
+                                static_cast<unsigned long long>(mi.size / 1024), mi.device_count);
                     }
+                    if (mi.size == size) { best = mi.base_address; best_size = mi.size; break; }
+                    if (mi.size >= min && mi.size > best_size) { best = mi.base_address; best_size = mi.size; }
                 }
                 const u64 next = mi.base_address + mi.size;
                 if (next <= addr) { break; }
                 addr = next;
             }
-            LogLine("ovlprobe: %s - %u candidate region(s), %u blocks", name, g_nregs, blocks);
+            *out_base = best; *out_size = best_size;
+            return best != 0;
         }
-        void Save(svc::Handle h, u32 t, const char *name, u32 r) {
-            Region &g = g_regs[r];
-            if (g_saves[t][r & 15] >= 3) { return; }
-            const u32 n = g_saves[t][r & 15]++;
+
+        void Save(svc::Handle h, const char *name, u64 base, u64 size, Pumper &pm) {
+            if (g_saves >= 6) { return; }
             char path[128];
-            std::snprintf(path, sizeof(path), "%s/ovl-%s-%010llx-%u.bin", ProbeDir, name, static_cast<unsigned long long>(g.base), n);
+            std::snprintf(path, sizeof(path), "%s/ovl2-%s-%010llx-%u.bin", ProbeDir, name, static_cast<unsigned long long>(base), g_saves++);
             static_cast<void>(fs::DeleteFile(path));
-            if (R_FAILED(fs::CreateFile(path, static_cast<s64>(g.size)))) { return; }
+            if (R_FAILED(fs::CreateFile(path, static_cast<s64>(size)))) { return; }
             fs::FileHandle f;
             if (R_FAILED(fs::OpenFile(std::addressof(f), path, fs::OpenMode_Write))) { return; }
-            for (u64 off = 0; off < g.size; off += Chunk) {
-                const size_t len = static_cast<size_t>(g.size - off < Chunk ? g.size - off : Chunk);
-                if (!DbgRead(h, g_buf, g.base + off, len)) { std::memset(g_buf, 0, len); }
+            for (u64 off = 0; off < size; off += Chunk) {
+                const size_t len = static_cast<size_t>(size - off < Chunk ? size - off : Chunk);
+                if (!DbgRead(h, g_buf, base + off, len)) { std::memset(g_buf, 0, len); }
                 static_cast<void>(fs::WriteFile(f, static_cast<s64>(off), g_buf, len, fs::WriteOption::None));
-                if ((off & 0xFFFFF) == 0) { Pump(h); }
+                if ((off & 0x3FFFF) == 0) { Pump(h, pm); }
             }
             static_cast<void>(fs::FlushFile(f));
             fs::CloseFile(f);
-            LogLine("ovlprobe: %s saved %s", name, path);
+            LogLine("ovl2: %s saved %s", name, path);
         }
-        void Window(u32 t) {
-            const Target &tg = Targets[t];
-            const u64 pid = PidOf(tg.program);
-            if (pid == 0) { LogLine("ovlprobe: %s is not running", tg.name); return; }
-            svc::Handle h = svc::InvalidHandle;
-            const Result arc = svc::DebugActiveProcess(std::addressof(h), pid);
-            if (R_FAILED(arc)) { LogLine("ovlprobe: %s (pid %llu) - DebugActiveProcess rc=0x%x", tg.name, static_cast<unsigned long long>(pid), arc.GetValue()); return; }
-            u32 nev = 0;
-            const Result crc = DbgResume(h, std::addressof(nev));
-            LogLine("ovlprobe: %s (pid %llu) attached, %u events, continue rc=0x%x", tg.name, static_cast<unsigned long long>(pid), nev, crc.GetValue());
-            g_pumped = 0;
-            Map(h, tg.name);
-            for (u32 r = 0; r < g_nregs; ++r) {
-                const Region &g = g_regs[r];
-                for (u64 off = 0; off < g.size; off += Block) {
-                    g_hash[g.block0 + off / Block] = HashBlock(h, g.base + off, static_cast<size_t>(g.size - off < Block ? g.size - off : Block));
-                }
-                Pump(h);
+
+        /* is the volume bar (or anything in the top-left corner) showing? The
+         * first 4 KB of a buffer is rows 0-63 of its 16 leftmost pixels; the
+         * bar's box covers them, and a hidden buffer is all zero */
+        int BarShowing(svc::Handle h, u64 base, Cost &c) {
+            int vis = 0;
+            for (u32 b = 0; b < 2; ++b) {
+                if (!Read(h, c, g_buf, base + b * BarBufBytes, 0x1000)) { return -1; }
+                for (u32 i = 3; i < 0x1000; i += 4) { if (g_buf[i] != 0) { vis = 1; break; } }
             }
-            const u64 start = armTicksToNs(armGetSystemTick());
-            for (u32 sec = 0; sec < 20; ++sec) {
-                u32 changed[MaxRegions] = {}, first[MaxRegions], last[MaxRegions] = {};
-                for (u32 r = 0; r < MaxRegions; ++r) { first[r] = 0xFFFFFFFF; }
-                for (u32 tick = 0; tick < 5; ++tick) {
-                    const u64 due = start + (static_cast<u64>(sec) * 5 + tick + 1) * 200000000;
-                    for (u32 r = 0; r < g_nregs; ++r) {
-                        const Region &g = g_regs[r];
-                        bool any = false;
-                        for (u64 off = 0; off < g.size; off += Block) {
-                            const u32 bi = static_cast<u32>(off / Block);
-                            const u32 v = HashBlock(h, g.base + off, static_cast<size_t>(g.size - off < Block ? g.size - off : Block));
-                            if (v != g_hash[g.block0 + bi]) {
-                                g_hash[g.block0 + bi] = v;
-                                ++changed[r]; any = true;
-                                if (bi < first[r]) { first[r] = bi; }
-                                if (bi > last[r]) { last[r] = bi; }
-                            }
-                        }
-                        if (any) { Save(h, t, tg.name, r); }
-                        Pump(h);
+            return vis;
+        }
+
+        enum Mode { Detached, Idle, Light, Heavy };
+        constexpr const char *ModeName[] = { "od-detached", "od-idle", "od-light", "od-heavy" };
+
+        void OverlayDispWindow(Mode mode) {
+            const char *tag = ModeName[mode];
+            if (mode == Detached) {
+                for (u32 sec = 0; sec < 15; ++sec) {
+                    const Sec s0 = SecNow();
+                    os::SleepThread(TimeSpan::FromSeconds(1));
+                    SecLog(tag, sec, s0, Cost{}, -1, "");
+                }
+                return;
+            }
+            const u64 pid = PidOf(OverlayDispProgramId);
+            if (pid == 0) { LogLine("ovl2: overlayDisp is not running"); os::SleepThread(TimeSpan::FromSeconds(15)); return; }
+            svc::Handle h = svc::InvalidHandle;
+            if (const Result rc = svc::DebugActiveProcess(std::addressof(h), pid); R_FAILED(rc)) {
+                LogLine("ovl2: overlayDisp - DebugActiveProcess rc=0x%x", rc.GetValue());
+                os::SleepThread(TimeSpan::FromSeconds(15));
+                return;
+            }
+            u32 nev = 0;
+            static_cast<void>(DbgResume(h, std::addressof(nev)));
+            Pumper pm;
+            u64 base = 0, size = 0;
+            const bool found = FindRegion(h, "overlayDisp", OdRegionBytes, OdRegionBytes, std::addressof(base), std::addressof(size), g_od_base_last == 0);
+            if (!found) {
+                LogLine("ovl2: overlayDisp - no %llu KB region", static_cast<unsigned long long>(OdRegionBytes / 1024));
+            } else if (base != g_od_base_last) {
+                LogLine("ovl2: overlayDisp region %010llx (%llu KB)%s", static_cast<unsigned long long>(base), static_cast<unsigned long long>(size / 1024),
+                        g_od_base_last != 0 ? " - MOVED" : "");
+                g_od_base_last = base;
+            }
+            const size_t bulk = mode == Heavy ? 512 * 1024 : (mode == Light ? 64 * 1024 : 0);
+            u64 bulk_off = 0;
+            int last_vis = 0;
+            const u64 t_start = NowNs();
+            for (u32 sec = 0; sec < 15 && found; ++sec) {
+                const Sec s0 = SecNow();
+                Cost c;
+                int vis = 0;
+                bool saved = false;
+                for (u32 tick = 0; tick < 20; ++tick) {
+                    const u64 due = t_start + (static_cast<u64>(sec) * 20 + tick + 1) * 50000000;
+                    Pump(h, pm);
+                    if ((tick % 4) == 0) {
+                        const int v = BarShowing(h, base, c);
+                        if (v > vis) { vis = v; }
+                        if (v == 1 && last_vis == 0 && !saved) { Save(h, "overlayDisp", base, size, pm); saved = true; }
+                        if (v >= 0) { last_vis = v; }
                     }
-                    const u64 now = armTicksToNs(armGetSystemTick());
+                    for (size_t done = 0; done < bulk; done += Chunk) {
+                        static_cast<void>(Read(h, c, g_buf, base + bulk_off, Chunk));
+                        bulk_off = (bulk_off + Chunk) % size;
+                    }
+                    const u64 now = NowNs();
                     if (now < due) { os::SleepThread(TimeSpan::FromNanoSeconds(static_cast<s64>(due - now))); }
                 }
-                for (u32 r = 0; r < g_nregs; ++r) {
-                    if (changed[r] == 0) { continue; }
-                    LogLine("ovlprobe: %s %2u s: region %010llx changed %u block(s) in 5 samples, 64 KB blocks %u-%u",
-                            tg.name, sec, static_cast<unsigned long long>(g_regs[r].base), changed[r], first[r], last[r]);
-                }
+                SecLog(tag, sec, s0, c, vis, saved ? " (saved a snapshot)" : "");
             }
             svc::CloseHandle(h);
-            LogLine("ovlprobe: %s detached (%u debug-event wakes)", tg.name, g_pumped);
+            if (pm.events != 0) { LogLine("ovl2: overlayDisp detached - %u debug events", pm.events); }
+        }
+
+        void TeslaWindow() {
+            const u64 pid = PidOf(TeslaProgramId);
+            if (pid == 0) {
+                for (u32 sec = 0; sec < 15; ++sec) {
+                    const Sec s0 = SecNow();
+                    os::SleepThread(TimeSpan::FromSeconds(1));
+                    SecLog("tesla-off", sec, s0, Cost{}, -1, "");
+                }
+                return;
+            }
+            svc::Handle h = svc::InvalidHandle;
+            if (const Result rc = svc::DebugActiveProcess(std::addressof(h), pid); R_FAILED(rc)) {
+                LogLine("ovl2: tesla - DebugActiveProcess rc=0x%x", rc.GetValue());
+                os::SleepThread(TimeSpan::FromSeconds(15));
+                return;
+            }
+            u32 nev = 0;
+            static_cast<void>(DbgResume(h, std::addressof(nev)));
+            Pumper pm;
+            pm.last = NowNs();
+            u64 base = 0, size = 0;
+            const bool found = FindRegion(h, "tesla", 0, 1024 * 1024, std::addressof(base), std::addressof(size), g_tesla_base_last == 0);
+            if (found && base != g_tesla_base_last) {
+                LogLine("ovl2: tesla region %010llx (%llu KB)%s", static_cast<unsigned long long>(base), static_cast<unsigned long long>(size / 1024),
+                        g_tesla_base_last != 0 ? " - MOVED (a new buffer)" : "");
+                g_tesla_base_last = base;
+            }
+            constexpr u32 MaxBlocks = 32;
+            u32 hashes[MaxBlocks] = {};
+            const u32 nb = found ? static_cast<u32>(((size + Block - 1) / Block) < MaxBlocks ? (size + Block - 1) / Block : MaxBlocks) : 0;
+            bool first_hash = true, saved = false;
+            const u64 t_start = NowNs();
+            for (u32 sec = 0; sec < 15; ++sec) {
+                const Sec s0 = SecNow();
+                Cost c;
+                u32 changed = 0;
+                const u32 ev0 = pm.events;
+                pm.max_gap = 0;
+                for (u32 tick = 0; tick < 200; ++tick) {   /* 5 ms */
+                    const u64 due = t_start + (static_cast<u64>(sec) * 200 + tick + 1) * 5000000;
+                    Pump(h, pm);
+                    if (found && (tick % 100) == 0) {
+                        for (u32 b = 0; b < nb; ++b) {
+                            u32 v = 2166136261u;
+                            const u64 boff = static_cast<u64>(b) * Block;
+                            for (u64 o = 0; o < Block && boff + o < size; o += Chunk) {
+                                const size_t len = static_cast<size_t>(size - (boff + o) < Chunk ? size - (boff + o) : Chunk);
+                                if (Read(h, c, g_buf, base + boff + o, len)) { v = Fnv(g_buf, len, v); }
+                            }
+                            if (!first_hash && v != hashes[b]) { ++changed; }
+                            hashes[b] = v;
+                            Pump(h, pm);   /* between blocks, so a thread event never waits a whole pass */
+                        }
+                        first_hash = false;
+                    }
+                    const u64 now = NowNs();
+                    if (now < due) { os::SleepThread(TimeSpan::FromNanoSeconds(static_cast<s64>(due - now))); }
+                }
+                char extra[96];
+                std::snprintf(extra, sizeof(extra), " | events %u, longest gap %llu us, changed %u blocks%s",
+                              pm.events - ev0, static_cast<unsigned long long>(pm.max_gap / 1000), changed,
+                              (changed != 0 && !saved && g_saves < 6) ? " (saved a snapshot)" : "");
+                if (changed != 0 && !saved && g_saves < 6) { Save(h, "tesla", base, size, pm); saved = true; }
+                SecLog("tesla", sec, s0, c, -1, extra);
+            }
+            svc::CloseHandle(h);
+            LogLine("ovl2: tesla detached - %u debug events in the window", pm.events);
         }
 
         void ProbeThread(void *) {
             os::SleepThread(TimeSpan::FromSeconds(40));
             if (!ProbeOn()) { return; }
+            const u32 start = StartDelay();
             static_cast<void>(fs::CreateDirectory(ProbeDir));
-            LogLine("ovlprobe: on (probe 1) - the system overlay and Tesla/Ultrahand, 20 s windows from ~70 s, for ~6 minutes");
-            os::SleepThread(TimeSpan::FromSeconds(30));
-            for (u32 round = 0; round < 6; ++round) {
-                for (u32 t = 0; t < sizeof(Targets) / sizeof(Targets[0]); ++t) { Window(t); }
-                os::SleepThread(TimeSpan::FromSeconds(10));
+            LogLine("ovl2: on (probe 2) - from %u s after start, 10 cycles of 75 s: overlayDisp detached / idle / light / heavy, then Tesla", start);
+            os::SleepThread(TimeSpan::FromSeconds(start > 40 ? start - 40 : 0));
+            for (u32 cycle = 0; cycle < 10; ++cycle) {
+                LogLine("ovl2: cycle %u", cycle);
+                for (u32 m = 0; m < 4; ++m) { OverlayDispWindow(static_cast<Mode>(m)); }
+                TeslaWindow();
             }
-            LogLine("ovlprobe: done");
+            LogLine("ovl2: done (%u Tesla vi:m transactions, %u presents)", g_tesla_txns.load(), g_tesla_presents.load());
         }
 
+    }
+
+    void OvlProbeArm() {
+        if (!ProbeOn()) { return; }
+        g_ovl_vi_mitm.store(true, std::memory_order_relaxed);
+        LogLine("ovl2: Tesla's new vi:m sessions will be wrapped (counted, never captured)");
+    }
+
+    void OvlNoteTeslaTransaction(u32 code, const void *in, size_t in_size) {
+        g_tesla_txns.fetch_add(1, std::memory_order_relaxed);
+        if (code == 7) { g_tesla_presents.fetch_add(1, std::memory_order_relaxed); }
+        if (code < 16 && g_tesla_logged[code] < 3) {
+            ++g_tesla_logged[code];
+            s32 slot = -1;
+            if (code == 7) { slot = ParseParcelSlot(static_cast<const u8 *>(in), in_size); }
+            LogLine("ovl2: tesla binder code %u, %zu B in%s%d", code, in_size, code == 7 ? ", queueBuffer slot " : "", code == 7 ? slot : 0);
+        }
     }
 
     void OvlProbeStart() {
@@ -220,6 +361,9 @@ namespace ams::mitm::applet {
 
 namespace ams::mitm::applet {
 
+    constinit std::atomic<bool> g_ovl_vi_mitm{false};
+    void OvlProbeArm() { }
+    void OvlNoteTeslaTransaction(u32, const void *, size_t) { }
     void OvlProbeStart() { }
 
 }

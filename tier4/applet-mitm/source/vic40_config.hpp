@@ -60,6 +60,27 @@ namespace ams::mitm::applet::vic {
     constexpr u32 SET_APPLICATION_ID              = 0x00000200;
     constexpr u32 EXECUTE                         = 0x00000300;
     constexpr u32 SET_SURFACE0_SLOT0_LUMA_OFFSET  = 0x00000400;
+    /* v0.7.14 ovl2: the other slots' surfaces. 0x400-0x6FF holds 8 slots x 8
+     * surfaces (fields) x {luma, chroma U, chroma V}, slot-major: a slot's
+     * surface 0 is 0x60 past the previous slot's. Not in libdrm (it only
+     * uses slot 0) or NVIDIA's later class headers (they moved the table to
+     * 0x1200); Ryujinx's VicRegisters lays it out this way, and the same
+     * layout puts SET_CONTROL_PARAMS at 0x704, SET_CONFIG_STRUCT_OFFSET at
+     * 0x708 and the output surface at 0x720, all proven here. */
+    constexpr u32 SlotSurfaceStride = 0x60;
+    constexpr u32 SlotLumaOffsetMethod(u32 slot) { return SET_SURFACE0_SLOT0_LUMA_OFFSET + slot * SlotSurfaceStride; }
+    static_assert(SlotLumaOffsetMethod(8) == 0x700);
+    /* blending factor selects (libdrm vic.h VIC_BLEND_*): what slot n's
+     * colour and alpha are multiplied by (Src) and what the result so far is
+     * multiplied by (Dst) - K1/K2 are BlendingSlotStruct's AlphaK1/AlphaK2,
+     * 1023 = 1.0; "SRC"/"DST" in the names are the alphas */
+    constexpr u32 BLEND_SRCFACTC_K1 = 0, BLEND_SRCFACTC_K1_TIMES_DST = 1, BLEND_SRCFACTC_NEG_K1_TIMES_DST = 2,
+                  BLEND_SRCFACTC_K1_TIMES_SRC = 3, BLEND_SRCFACTC_ZERO = 4;
+    constexpr u32 BLEND_DSTFACTC_K1 = 0, BLEND_DSTFACTC_K2 = 1, BLEND_DSTFACTC_K1_TIMES_DST = 2,
+                  BLEND_DSTFACTC_NEG_K1_TIMES_DST = 3, BLEND_DSTFACTC_NEG_K1_TIMES_SRC = 4,
+                  BLEND_DSTFACTC_ZERO = 5, BLEND_DSTFACTC_ONE = 6;
+    constexpr u32 BLEND_SRCFACTA_K1 = 0, BLEND_SRCFACTA_K2 = 1, BLEND_SRCFACTA_NEG_K1_TIMES_DST = 2, BLEND_SRCFACTA_ZERO = 3;
+    constexpr u32 BLEND_DSTFACTA_K2 = 0, BLEND_DSTFACTA_NEG_K1_TIMES_SRC = 1, BLEND_DSTFACTA_ZERO = 2, BLEND_DSTFACTA_ONE = 3;
     constexpr u32 SET_CONTROL_PARAMS              = 0x00000704;
     constexpr u32 SET_CONFIG_STRUCT_OFFSET        = 0x00000708;
     constexpr u32 SET_OUTPUT_SURFACE_LUMA_OFFSET  = 0x00000720;

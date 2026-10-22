@@ -52,6 +52,7 @@
 #include "applet_mitm_net.hpp"
 #include "applet_mitm_slotmatch.hpp"
 #include "applet_mitm_idlework.hpp"
+#include "applet_mitm_ovlprobe.hpp"
 #include <atomic>
 #include <cstring>
 #include <cstdio>
@@ -1048,6 +1049,66 @@ namespace ams::mitm::applet {
             s->SlotChromaHeight  = 16383;
         }
 
+        /* v0.7.14 ovl2: a second input blended over slot 0 in the same job - an
+         * overlay layer (the volume bar, Tesla). nullptr, the default: slot 0
+         * alone and the job byte-for-byte as before. Only BlitStrip jobs (the
+         * stream's) take it. Its address is guarded like the others in
+         * RunOneJob: a zero address hangs the VIC and the console with it. */
+        struct BlendSlot {
+            u32 addr;                           /* device address of its surface */
+            SrcDesc src;                        /* rect_w/rect_h: the part sampled */
+            u32 dst_l, dst_t, dst_r, dst_b;     /* where it lands, inclusive */
+            u32 k1;                             /* AlphaK1, 1023 = 1.0 */
+            u8 src_c, dst_c, src_a, dst_a;      /* vic::BLEND_* selects */
+            bool constant_alpha;                /* PlanarAlpha instead of the pixels' alpha */
+            bool slot0_factors;                 /* also give slot 0 explicit replace factors */
+        };
+        constinit const BlendSlot *g_slot1 = nullptr;
+
+        void FillSlot1(vic::VicConfigStruct *c, const BlendSlot &b) {
+            vic::SlotConfig *slot = std::addressof(c->slotStruct[1].slotConfig);
+            slot->SlotEnable          = 1;
+            slot->CurrentFieldEnable  = 1;
+            slot->PlanarAlpha         = 1023;
+            slot->ConstantAlpha       = b.constant_alpha ? 1 : 0;
+            slot->SourceRectLeft      = 0;
+            slot->SourceRectRight     = static_cast<u64>(b.src.rect_w - 1) << 16;
+            slot->SourceRectTop       = 0;
+            slot->SourceRectBottom    = static_cast<u64>(b.src.rect_h - 1) << 16;
+            slot->DestRectLeft        = b.dst_l;
+            slot->DestRectRight       = b.dst_r;
+            slot->DestRectTop         = b.dst_t;
+            slot->DestRectBottom      = b.dst_b;
+            slot->SoftClampHigh       = 1023;
+
+            vic::SlotSurfaceConfig *s = std::addressof(c->slotStruct[1].slotSurfaceConfig);
+            s->SlotPixelFormat   = b.src.pixfmt;
+            s->SlotBlkKind       = b.src.blk_kind;
+            s->SlotBlkHeight     = b.src.blk_h_log2;
+            s->SlotCacheWidth    = b.src.cache_w;
+            s->SlotSurfaceWidth  = b.src.w - 1;
+            s->SlotSurfaceHeight = b.src.h - 1;
+            s->SlotLumaWidth     = b.src.stride_px - 1;
+            s->SlotLumaHeight    = b.src.h - 1;
+            s->SlotChromaWidth   = 16383;
+            s->SlotChromaHeight  = 16383;
+
+            vic::BlendingSlotStruct *bl = std::addressof(c->slotStruct[1].blendingSlotStruct);
+            bl->AlphaK1 = b.k1;
+            bl->SrcFactCMatchSelect = b.src_c;
+            bl->DstFactCMatchSelect = b.dst_c;
+            bl->SrcFactAMatchSelect = b.src_a;
+            bl->DstFactAMatchSelect = b.dst_a;
+            if (b.slot0_factors) {
+                vic::BlendingSlotStruct *b0 = std::addressof(c->slotStruct[0].blendingSlotStruct);
+                b0->AlphaK1 = 1023;
+                b0->SrcFactCMatchSelect = vic::BLEND_SRCFACTC_K1;
+                b0->DstFactCMatchSelect = vic::BLEND_DSTFACTC_ZERO;
+                b0->SrcFactAMatchSelect = vic::BLEND_SRCFACTA_K1;
+                b0->DstFactAMatchSelect = vic::BLEND_DSTFACTA_ZERO;
+            }
+        }
+
         /* host1x pushbuf: VIC_PUSH_METHOD / VIC_PUSH_BUFFER from libdrm vic.h.
          * Each entry: [INCR(0x10,2)] [method>>2] [value|reloc-placeholder]. */
         constexpr u32 Host1xIncr0x10x2 = (UINT32_C(1) << 28) | (0x10u << 16) | 2u;
@@ -1056,7 +1117,7 @@ namespace ams::mitm::applet {
         constexpr u32 CfgAddrWord = 8, DstAddrWord = 11, SrcAddrWord = 14;   /* + 1 if SETCL is emitted */
 
         u32 BuildCmdbuf(u32 *w, VicJob job, u32 cfg_addr, u32 dst_addr, u32 src_addr, bool set_class,
-                        u32 chroma_addr = 0) {
+                        u32 chroma_addr = 0, u32 slot1_addr = 0) {
             const bool has_src  = (job == VicJob::BlitSelf || job == VicJob::BlitGame || job == VicJob::BlitStrip);
             u32 n = 0;
             /* Point the channel at the VIC's register space before touching
@@ -1081,6 +1142,11 @@ namespace ams::mitm::applet {
             if (has_src) {
                 w[n++] = Host1xIncr0x10x2; w[n++] = vic::SET_SURFACE0_SLOT0_LUMA_OFFSET >> 2;
                 w[n++] = src_addr >> 8;
+            }
+            /* v0.7.14 ovl2: the overlay's surface, when slot 1 is on */
+            if (has_src && slot1_addr != 0) {
+                w[n++] = Host1xIncr0x10x2; w[n++] = vic::SlotLumaOffsetMethod(1) >> 2;
+                w[n++] = slot1_addr >> 8;
             }
             w[n++] = Host1xIncr0x10x2; w[n++] = vic::EXECUTE >> 2; w[n++] = 1u << 8;
             return n;
@@ -1215,10 +1281,12 @@ namespace ams::mitm::applet {
             VicStage(stage);
 
             const bool needs_src = (job == VicJob::BlitSelf || job == VicJob::BlitGame || job == VicJob::BlitStrip);
-            if (c.cfg_addr == 0 || c.dst_addr == 0 || (needs_src && c.src_addr == 0)) {
-                LogLine("   [%s] REFUSING to submit: cfg=0x%x dst=0x%x src=0x%x - a zero "
+            /* v0.7.14 ovl2: and the overlay slot's, when it is on */
+            const BlendSlot *slot1 = (job == VicJob::BlitStrip) ? g_slot1 : nullptr;
+            if (c.cfg_addr == 0 || c.dst_addr == 0 || (needs_src && c.src_addr == 0) || (slot1 != nullptr && slot1->addr == 0)) {
+                LogLine("   [%s] REFUSING to submit: cfg=0x%x dst=0x%x src=0x%x slot1=0x%x - a zero "
                         "address hangs the VIC and freezes the console",
-                        stage, c.cfg_addr, c.dst_addr, c.src_addr);
+                        stage, c.cfg_addr, c.dst_addr, c.src_addr, slot1 != nullptr ? slot1->addr : 0xFFFFFFFFu);
                 return false;
             }
 
@@ -1244,6 +1312,7 @@ namespace ams::mitm::applet {
                 m.matrix_r_shift = p.shift;
                 m.matrix_enable  = 1;
             }
+            if (slot1 != nullptr) { FillSlot1(cfg, *slot1); }
 
             /* pick the OutDesc this job will actually use, so the chroma base
              * matches the config struct we just filled */
@@ -1251,7 +1320,8 @@ namespace ams::mitm::applet {
             const u32 chroma_addr = vic::IsNv12(job_out.fmt) ? (c.dst_addr + Nv12LumaBytes(job_out)) : 0u;
 
             auto *w = reinterpret_cast<u32 *>(g_vic_cmd_buf);
-            u32 words = BuildCmdbuf(w, job, c.cfg_addr, c.dst_addr, c.src_addr + c.src_off, set_class, chroma_addr);
+            u32 words = BuildCmdbuf(w, job, c.cfg_addr, c.dst_addr, c.src_addr + c.src_off, set_class, chroma_addr,
+                                    slot1 != nullptr ? slot1->addr : 0u);
             const u32 rw = set_class ? 1u : 0u;   /* reloc word indices shift when SETCL leads */
             words = AppendIncrSyncpt(w, words, c.syncpt, true);
 
@@ -1518,6 +1588,172 @@ namespace ams::mitm::applet {
             VicStage("csc:done");
         }
 
+#if SFT_OVL_PROBE
+        /* ---- v0.7.14 ovl2: the blend card ---------------------------------
+         * Does the VIC blend a second slot over the first, and with which
+         * factors? Slot 0: a 64x32 background card; slot 1: an overlay card of
+         * eight 4-row bands with known alphas (the decoded overlays are
+         * premultiplied, logs/v0714-ovl1-run1/decoded). One job per variant,
+         * output RGBA (pitch), every variant's output saved for the PC
+         * (tools/vic_blend.py). All buffers are ours, every address non-zero.
+         * Once a boot with config/switch-frame-tap/probe-blend.txt; a marker
+         * file stops it running again after a boot it did not finish. */
+        constexpr u32 BcW = 64, BcH = 32, BcStridePx = 256;
+        constexpr size_t BcSurfBytes = BcStridePx * 4 * BcH;          /* 32 KB */
+        static_assert(2 * BcSurfBytes <= VicSrcSize, "both cards fit our source buffer");
+        static_assert(BcSurfBytes <= DstSize, "the output fits what RunOneJob flushes");
+        constexpr u8 BcBand[8][4] = {
+            {   0,   0,   0,   0 },   /* transparent: the background */
+            { 255, 255, 255, 255 },   /* opaque white */
+            { 128, 128, 128, 128 },   /* 50 % white */
+            {  64,   0,   0,  64 },   /* 25 % red */
+            {   0,   0,   0, 128 },   /* 50 % black: the background halved */
+            { 255,   0,   0,   0 },   /* colour with alpha 0: added (premultiplied) or dropped (straight) */
+            {   0,   0,   0, 255 },   /* opaque black: is alpha byte 3? */
+            { 192,  96,  48, 192 },   /* 75 % orange */
+        };
+        struct BcVariant { char name[16]; u32 k1; u8 src_c, dst_c, src_a, dst_a; bool enable, constant_alpha, slot0_factors, scaled, block_linear; };
+        constexpr BcVariant BcVariants[] = {
+            { "off",        0,    0, 0, 0, 0, false, false, false, false, false },
+            { "zero",       0,    0, 0, 0, 0, true,  false, false, false, false },
+            { "premul",     1023, vic::BLEND_SRCFACTC_K1, vic::BLEND_DSTFACTC_NEG_K1_TIMES_SRC,
+                                  vic::BLEND_SRCFACTA_K1, vic::BLEND_DSTFACTA_NEG_K1_TIMES_SRC, true, false, false, false, false },
+            { "straight",   1023, vic::BLEND_SRCFACTC_K1_TIMES_SRC, vic::BLEND_DSTFACTC_NEG_K1_TIMES_SRC,
+                                  vic::BLEND_SRCFACTA_K1, vic::BLEND_DSTFACTA_NEG_K1_TIMES_SRC, true, false, false, false, false },
+            { "premul_s0",  1023, vic::BLEND_SRCFACTC_K1, vic::BLEND_DSTFACTC_NEG_K1_TIMES_SRC,
+                                  vic::BLEND_SRCFACTA_K1, vic::BLEND_DSTFACTA_NEG_K1_TIMES_SRC, true, false, true,  false, false },
+            { "constant",   1023, vic::BLEND_SRCFACTC_K1, vic::BLEND_DSTFACTC_NEG_K1_TIMES_SRC,
+                                  vic::BLEND_SRCFACTA_K1, vic::BLEND_DSTFACTA_NEG_K1_TIMES_SRC, true, true,  false, false, false },
+            { "premul_x1.5", 1023, vic::BLEND_SRCFACTC_K1, vic::BLEND_DSTFACTC_NEG_K1_TIMES_SRC,
+                                  vic::BLEND_SRCFACTA_K1, vic::BLEND_DSTFACTA_NEG_K1_TIMES_SRC, true, false, false, true,  false },
+            { "premul_bl",  1023, vic::BLEND_SRCFACTC_K1, vic::BLEND_DSTFACTC_NEG_K1_TIMES_SRC,
+                                  vic::BLEND_SRCFACTA_K1, vic::BLEND_DSTFACTA_NEG_K1_TIMES_SRC, true, false, false, false, true  },
+        };
+        constexpr u32 BcNumVariants = sizeof(BcVariants) / sizeof(BcVariants[0]);
+        struct __attribute__((packed)) BcFileHdr { u32 magic, version, count, w, h, reserved[3]; };
+        struct __attribute__((packed)) BcFileRec { char name[16]; u32 completed, enable, constant_alpha, slot0_factors, scaled, block_linear; u8 k1_lo, k1_hi, src_c, dst_c, src_a, dst_a, pad[2]; };
+        static_assert(sizeof(BcFileHdr) == 32 && sizeof(BcFileRec) == 48, "must match tools/vic_blend.py");
+        constexpr size_t BcFileBytes = sizeof(BcFileHdr) + 2 * BcW * BcH * 4 + BcNumVariants * (sizeof(BcFileRec) + BcW * BcH * 4);
+        constexpr const char *BcTrigger = "sdmc:/config/switch-frame-tap/probe-blend.txt";
+        constexpr const char *BcMarker  = "sdmc:/config/switch-frame-tap/probe/blend-running.txt";
+
+        bool FileThere(const char *path) {
+            fs::DirectoryEntryType t;
+            return R_SUCCEEDED(fs::GetEntryType(std::addressof(t), path));
+        }
+
+        /* the block-linear offset of byte x of row y (64-byte x 8-row GOBs,
+         * 2^blk_h GOBs to a block; rows < 8 << blk_h only, one block row) */
+        u32 BcBlOffset(u32 xbyte, u32 y, u32 blk_h_log2) {
+            const u32 block_sz = 512u << blk_h_log2;
+            const u32 gob_y = y / 8, yy = y % 8, xb = xbyte % 64;
+            return (xbyte / 64) * block_sz + gob_y * 512 + (xb / 32) * 256 + (yy / 2) * 64 + ((xb % 32) / 16) * 32 + (yy % 2) * 16 + (xb % 16);
+        }
+
+        void TryBlendCard(u32 vfd, u32 cmd_handle, u32 syncpt, u32 cfg_addr, u32 dst_addr, u32 self_addr) {
+            if (!FileThere(BcTrigger)) { return; }
+            static_cast<void>(fs::CreateDirectory("sdmc:/config/switch-frame-tap/probe"));
+            if (FileThere(BcMarker)) {
+                LogLine("   blend card: it did not finish on an earlier boot (%s) - not running it again", BcMarker);
+                return;
+            }
+            /* the dmnt:cht bounce: free until the stream reads through it */
+            u8 *const f = g_vic_heap != 0 ? reinterpret_cast<u8 *>(g_vic_heap + VicBounceOff) : nullptr;
+            if (f == nullptr || 2 * ((BcFileBytes + 0xFFF) & ~static_cast<size_t>(0xFFF)) > VicBounceSize) {
+                LogLine("   blend card: no room to assemble its file - not running");
+                return;
+            }
+            static_cast<void>(fs::CreateFile(BcMarker, 0));
+            VicStage("blend:1");
+            LogLine("   ---- VIC BLEND CARD (ovl2): %u jobs, slot 1 over slot 0 on %ux%u cards we own ----", BcNumVariants, BcW, BcH);
+
+            u8 *const s0 = g_vic_src_buf, *const s1 = g_vic_src_buf + BcSurfBytes;
+            const u32 s1_addr = self_addr + static_cast<u32>(BcSurfBytes);
+            /* background: R rises left to right, B falls, G rises downwards */
+            std::memset(g_vic_src_buf, 0, 2 * BcSurfBytes);
+            for (u32 y = 0; y < BcH; ++y) {
+                for (u32 x = 0; x < BcW; ++x) {
+                    u8 *p = s0 + y * BcStridePx * 4 + x * 4;
+                    p[0] = static_cast<u8>(x * 4); p[1] = static_cast<u8>(64 + y * 4); p[2] = static_cast<u8>(255 - x * 4); p[3] = 255;
+                }
+            }
+            auto paint_pitch = [&]() {
+                std::memset(s1, 0, BcSurfBytes);
+                for (u32 y = 0; y < BcH; ++y) {
+                    for (u32 x = 0; x < BcW; ++x) { std::memcpy(s1 + y * BcStridePx * 4 + x * 4, BcBand[y / 4], 4); }
+                }
+            };
+            paint_pitch();
+
+            const BcFileHdr hdr = { 0x434C4256u /* "VBLC" */, 1, BcNumVariants, BcW, BcH, {} };
+            std::memcpy(f, std::addressof(hdr), sizeof(hdr));
+            size_t off = sizeof(hdr);
+            for (u32 y = 0; y < BcH; ++y) { std::memcpy(f + off, s0 + y * BcStridePx * 4, BcW * 4); off += BcW * 4; }
+            for (u32 y = 0; y < BcH; ++y) { std::memcpy(f + off, s1 + y * BcStridePx * 4, BcW * 4); off += BcW * 4; }
+
+            const JobCtx ctx{ vfd, cmd_handle, syncpt, cfg_addr, dst_addr, self_addr, 0, 0, 0, 0, SelfSrc };
+            const SrcDesc pitch_src{ BcW, BcH, BcStridePx, vic::BLK_KIND_PITCH, 0, vic::PIXFMT_A8B8G8R8, vic::CACHE_WIDTH_64Bx4, BcW, BcH };
+            u32 n_ok = 0;
+            for (u32 i = 0; i < BcNumVariants; ++i) {
+                const BcVariant &v = BcVariants[i];
+                if (v.block_linear) {
+                    /* the overlay card again, block-linear with 16-GOB blocks, as
+                     * the overlays' own buffers are */
+                    std::memset(s1, 0, BcSurfBytes);
+                    for (u32 y = 0; y < BcH; ++y) {
+                        for (u32 x = 0; x < BcW; ++x) {
+                            for (u32 b = 0; b < 4; ++b) { s1[BcBlOffset(x * 4 + b, y, 4)] = BcBand[y / 4][b]; }
+                        }
+                    }
+                }
+                armDCacheFlush(g_vic_src_buf, VicSrcSize);
+                g_strip_src = pitch_src;
+                g_strip_out = OutDesc{ BcW, BcH, BcStridePx, vic::PIXFMT_A8B8G8R8 };
+                g_strip_flip = 0;
+                BlendSlot b = {};
+                b.addr = s1_addr;
+                b.src = v.block_linear ? SrcDesc{ BcW, BcH, BcW, vic::BLK_KIND_GENERIC_16Bx2, 4, vic::PIXFMT_A8B8G8R8, vic::CACHE_WIDTH_64Bx4, BcW, BcH }
+                                       : pitch_src;
+                if (v.scaled) { b.src.rect_w = 32; b.src.rect_h = 16; b.dst_l = 0; b.dst_t = 0; b.dst_r = 47; b.dst_b = 23; }
+                else          { b.dst_l = 0; b.dst_t = 0; b.dst_r = BcW - 1; b.dst_b = BcH - 1; }
+                b.k1 = v.k1; b.src_c = v.src_c; b.dst_c = v.dst_c; b.src_a = v.src_a; b.dst_a = v.dst_a;
+                b.constant_alpha = v.constant_alpha; b.slot0_factors = v.slot0_factors;
+                g_slot1 = v.enable ? std::addressof(b) : nullptr;
+                std::memset(g_vic_dst_buf, 0xAB, DstSize);   /* poison: an untouched output stays 0xAB */
+                char stage[32];
+                std::snprintf(stage, sizeof(stage), "blend:%s", v.name);
+                const bool ok = RunOneJob(stage, VicJob::BlitStrip, true, ctx);
+                g_slot1 = nullptr;
+                if (ok) { ++n_ok; }
+
+                BcFileRec rec = {};
+                std::memcpy(rec.name, v.name, sizeof(rec.name));
+                rec.completed = ok ? 1 : 0; rec.enable = v.enable; rec.constant_alpha = v.constant_alpha;
+                rec.slot0_factors = v.slot0_factors; rec.scaled = v.scaled; rec.block_linear = v.block_linear;
+                rec.k1_lo = static_cast<u8>(v.k1 & 0xFF); rec.k1_hi = static_cast<u8>(v.k1 >> 8);
+                rec.src_c = v.src_c; rec.dst_c = v.dst_c; rec.src_a = v.src_a; rec.dst_a = v.dst_a;
+                std::memcpy(f + off, std::addressof(rec), sizeof(rec)); off += sizeof(rec);
+                /* g_vic_dst_buf is uncached: these reads see what the engine wrote */
+                for (u32 y = 0; y < BcH; ++y) { std::memcpy(f + off, g_vic_dst_buf + y * BcStridePx * 4, BcW * 4); off += BcW * 4; }
+                /* column 32 of each band's second row, for the log */
+                char line[8 * 16 + 1];
+                int k = 0;
+                for (u32 band = 0; band < 8; ++band) {
+                    const u8 *p = g_vic_dst_buf + (band * 4 + 1) * BcStridePx * 4 + 32 * 4;
+                    k += std::snprintf(line + k, sizeof(line) - k, " %02x%02x%02x%02x", p[0], p[1], p[2], p[3]);
+                }
+                LogLine("   blend[%-11s] %s:%s", v.name, ok ? "done" : "DID NOT COMPLETE", line);
+                if (!ok) { LogLine("   blend card: stopping at the first job that did not complete"); break; }
+            }
+            u32 fnv = 0;
+            const size_t slot = (off + 0xFFF) & ~static_cast<size_t>(0xFFF);
+            WriteSdVerified("sdmc:/config/switch-frame-tap/probe/vic-blend.bin", f, off, f + slot, std::addressof(fnv));
+            LogLine("   blend card: %u of %u jobs completed; %zu B -> probe/vic-blend.bin (tools/vic_blend.py)", n_ok, BcNumVariants, off);
+            static_cast<void>(fs::DeleteFile(BcMarker));
+            VicStage("blend:done");
+        }
+#endif
+
 
     }
 
@@ -1537,6 +1773,17 @@ namespace ams::mitm::applet {
     constinit std::atomic<u32> g_queue_fence_n{0};
     constinit bool g_nvab_armed = false;
     constinit std::atomic<u32> g_early_collect{1};
+    /* v0.7.14 ovl2: frames the live stream sent and their read and VIC time,
+     * for research that measures its own cost per second (the overlay probe) */
+    constinit std::atomic<u32> g_live_frames{0};
+    constinit std::atomic<u64> g_live_read_ns{0}, g_live_vic_ns{0};
+    namespace {
+        inline void LiveFrameSent(u64 read_ns, u64 vic_ns) {
+            g_live_frames.fetch_add(1, std::memory_order_relaxed);
+            g_live_read_ns.fetch_add(read_ns, std::memory_order_relaxed);
+            g_live_vic_ns.fetch_add(vic_ns, std::memory_order_relaxed);
+        }
+    }
     constinit std::atomic<u32> g_queue_transform{0};
     constinit std::atomic<u32> g_queue_crop_wh{0};
     constinit std::atomic<bool> g_queue_crop_origin0{true};
@@ -1966,6 +2213,18 @@ namespace ams::mitm::applet {
             }
         }
         VicStage("vb:ALL_JOBS_DONE");
+
+#if SFT_OVL_PROBE
+        /* v0.7.14 ovl2: the blend card, at the first setup of the boot (it
+         * returns at once without probe-blend.txt) */
+        {
+            static bool s_blend_tried = false;
+            if (!s_blend_tried && self_addr != 0 && cfg_addr != 0 && dst_addr != 0 && !g_engine_wedged) {
+                s_blend_tried = true;
+                TryBlendCard(vfd, cmd_handle, syncpt, cfg_addr, dst_addr, self_addr);
+            }
+        }
+#endif
 
         /* M82: VIC arithmetic on our own buffers, before anything touches the
          * game or another engine */
@@ -6934,7 +7193,7 @@ namespace ams::mitm::applet {
                     const u64 age = (f.present_ns != 0 && t6u > f.present_ns) ? t6u - f.present_ns : 0;
                     if (t4u - t3 > UINT64_C(500000000)) { ++viewer_gaps; }
                     ++done;
-                    ++w_n; w_read += f.rn; w_flush += f.flush_ns; w_vic += f.vic_ns; w_enc += enc_wait;
+                    ++w_n; w_read += f.rn; w_flush += f.flush_ns; w_vic += f.vic_ns; w_enc += enc_wait; LiveFrameSent(f.rn, f.vic_ns);
                     s_read += f.rn; s_vic += f.vic_ns; s_enc += enc_wait; s_usb += t6u - t3;
                     s_bytes += bytes;
                     if (f.is_idr) { s_bytes_i += bytes; ++n_i; } else { s_bytes_p += bytes; ++n_p; }
@@ -7005,7 +7264,7 @@ namespace ams::mitm::applet {
                 if ((t4 - t3) > UINT64_C(500000000) || (t6 - t5) > UINT64_C(500000000)) { need_idr = true; ++viewer_gaps; }
 
                 ++done;
-                ++w_n; w_read += f.rn; w_flush += f.flush_ns; w_vic += f.vic_ns; w_enc += enc_wait;
+                ++w_n; w_read += f.rn; w_flush += f.flush_ns; w_vic += f.vic_ns; w_enc += enc_wait; LiveFrameSent(f.rn, f.vic_ns);
                 s_read += f.rn; s_vic += f.vic_ns; s_enc += enc_wait; s_copy += t5 - t4; s_usb += (t4 - t3) + (t6 - t5);
                 s_bytes += bytes;
                 if (f.is_idr) { s_bytes_i += bytes; ++n_i; } else { s_bytes_p += bytes; ++n_p; }

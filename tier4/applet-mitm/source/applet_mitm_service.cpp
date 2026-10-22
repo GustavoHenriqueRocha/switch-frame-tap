@@ -168,6 +168,11 @@ namespace ams::mitm::applet {
     /* ---- IHOSBinderDriver: the frame pipeline -------------------------- */
 
     Result BinderMitm::TransactParcelAuto(s32 session_id, u32 code, u32 flags, const sf::InAutoSelectBuffer &parcel_in, const sf::OutAutoSelectBuffer &parcel_out) {
+        /* v0.7.14 ovl2: Tesla's layer - counted for the overlay probe, never the game's capture */
+        if (m_client_info.program_id.value == TeslaProgramId) {
+            OvlNoteTeslaTransaction(code, parcel_in.GetPointer(), parcel_in.GetSize());
+            R_RETURN(sm::mitm::ResultShouldForwardToSession());
+        }
         /* v0.7.14 probe4: a library applet's relay - logged, never the game's capture */
         if (IsLibraryApplet(m_client_info.program_id.value)) {
             UiNoteTransaction(m_client_info.program_id.value, session_id, code, parcel_in.GetPointer(), parcel_in.GetSize());
