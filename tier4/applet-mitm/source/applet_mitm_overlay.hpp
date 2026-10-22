@@ -44,6 +44,7 @@ namespace ams::mitm::applet {
         u32 w, h;                        /* the surface, pixels */
         u32 fmt;                         /* VIC pixel format */
         u32 x, y;                        /* where it goes on a 1280x720 screen */
+        u32 dw, dh;                      /* and how big it is there (w, h unless it was copied smaller) */
     };
     /* the overlays showing now, bottom first (0..max) */
     u32 OverlayPlanes(OverlayPlane *out, u32 max);

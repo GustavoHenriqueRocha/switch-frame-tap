@@ -1128,7 +1128,7 @@ namespace ams::mitm::applet {
                 b = {};
                 b.addr = p[i].dev;
                 b.src = SrcDesc{ p[i].w, p[i].h, p[i].w, vic::BLK_KIND_GENERIC_16Bx2, 4, p[i].fmt, vic::CACHE_WIDTH_64Bx4, p[i].w, p[i].h };
-                const u32 r = (p[i].x + p[i].w) * out.w / 1280, bt = (p[i].y + p[i].h) * out.h / 720;
+                const u32 r = (p[i].x + p[i].dw) * out.w / 1280, bt = (p[i].y + p[i].dh) * out.h / 720;
                 b.dst_l = p[i].x * out.w / 1280;
                 b.dst_t = p[i].y * out.h / 720;
                 b.dst_r = (r > out.w ? out.w : r) - 1;
