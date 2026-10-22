@@ -20,6 +20,7 @@ namespace ams::mitm::applet {
         /* v0.7.10: held in memory while a teardown races an applet - each
          * flushed line costs the SD ~15 ms, and 20 of them lost the race */
         constinit bool g_defer = false;
+        constinit u64 g_defer_tick = 0;   /* v0.7.14: held at most ~3 s - nothing waits forever for its release */
         constinit char g_defer_buf[8192];
         constinit size_t g_defer_len = 0;
 
@@ -114,11 +115,17 @@ namespace ams::mitm::applet {
         line[n++] = '\n';
 
         if (g_defer) {
-            if (g_defer_len + static_cast<size_t>(n) <= sizeof(g_defer_buf)) {
+            /* v0.7.14: held lines go out once the buffer is full or ~3 s on,
+             * rather than being dropped or kept for good */
+            const bool full = g_defer_len + static_cast<size_t>(n) > sizeof(g_defer_buf);
+            if (!full && armTicksToNs(armGetSystemTick() - g_defer_tick) < UINT64_C(3000000000)) {
                 std::memcpy(g_defer_buf + g_defer_len, line, static_cast<size_t>(n));
                 g_defer_len += static_cast<size_t>(n);
+                return;
             }
-            return;
+            g_defer = false;
+            if (g_defer_len != 0) { AppendToLog(g_defer_buf, g_defer_len); }
+            g_defer_len = 0;
         }
         /* open/append/close every line so a crash can't lose it */
         AppendToLog(line, static_cast<size_t>(n));
@@ -126,7 +133,11 @@ namespace ams::mitm::applet {
 
     void LogDefer(bool on) {
         std::scoped_lock lk(g_lock);
-        if (on) { g_defer = true; return; }
+        if (on) {
+            if (!g_defer) { g_defer_tick = armGetSystemTick(); }
+            g_defer = true;
+            return;
+        }
         g_defer = false;
         if (g_ready && g_defer_len != 0) { AppendToLog(g_defer_buf, g_defer_len); }
         g_defer_len = 0;

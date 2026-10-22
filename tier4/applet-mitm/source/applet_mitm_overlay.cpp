@@ -15,8 +15,9 @@
  *     content alone cannot say it is gone - probe 2).
  *   - Tesla / Ultrahand (nx-ovlloader) draws 2 x 448x720 RGBA4444 (1344 KB,
  *     premultiplied). Its presents come through vi:m (wrapped while this is
- *     on); while it presents, the buffer it last queued is converted to RGBA8
- *     10 times a second, and it is attached only then (attaching stalls it
+ *     on); while it presents, the buffer it last queued is looked at 10 times
+ *     a second (30 while its picture keeps changing - someone navigating it)
+ *     and converted to RGBA8 when it changed; it is attached only then (attaching stalls it
  *     while a debug event waits; events are answered every 10 ms).
  * Both go into an area of the VIC's own output buffer that streaming does not
  * use (applet_mitm_nv.cpp lends it while the engines are up), double-
@@ -85,13 +86,13 @@ namespace ams::mitm::applet {
         constexpr size_t OffTesla[2] = { 2 * BarBytes, 2 * BarBytes + TeslaDstBuf };
         constexpr size_t AreaNeeded  = 2 * BarBytes + 2 * TeslaDstBuf;
         static_assert(AreaNeeded <= 0x330000, "the overlays must fit the VIC output buffer past the self-tests' 64 KB");
-        /* the cached working memory: two reads of the bar's corner, one block
-         * row of Tesla's in and out */
-        constexpr size_t CachedBar[2]   = { 0, BarBytes };
-        constexpr size_t CachedTeslaIn  = 2 * BarBytes;
-        constexpr size_t CachedTeslaOut = CachedTeslaIn + TeslaSrcRow;
+        /* the cached working memory: the bar's corner, one of Tesla's buffers,
+         * a block row of it converted */
+        constexpr size_t CachedBar      = 0;
+        constexpr size_t CachedTeslaIn  = BarBytes;
+        constexpr size_t CachedTeslaOut = CachedTeslaIn + TeslaSrcBuf;
         constexpr size_t CachedNeeded   = CachedTeslaOut + TeslaDstRow;
-        static_assert(CachedNeeded <= 0x100000);
+        static_assert(CachedNeeded <= 0x140000);
 
         constexpr u64 OdBufBytes = UINT64_C(1280) * 768 * 4;     /* one overlayDisp buffer */
         constexpr u64 OdRegionBytes = 2 * OdBufBytes;            /* 7680 KB */
@@ -254,15 +255,15 @@ namespace ams::mitm::applet {
                 g_bar_seen[0] = g_bar_seen[1] = false;
             }
             const u32 b = (g_bar_turn++) & 1;
-            u8 *r0 = g_cached + CachedBar[0], *r1 = g_cached + CachedBar[1];
+            u8 *r0 = g_cached + CachedBar;
             const u64 va = g_od.base + b * OdBufBytes;
             if (!DbgRead(g_od.h, r0, va, BarBytes)) { Detach(g_od, "read failed"); return; }
             const u32 h = Fnv(r0, BarBytes);
             if (!g_bar_seen[b]) { g_bar_seen[b] = true; g_bar_hash[b] = h; return; }   /* the first look is not a change */
             if (h == g_bar_hash[b]) { return; }
             const u32 pub = g_bar_pub.load(std::memory_order_relaxed);
-            if (!DbgRead(g_od.h, r1, va, BarBytes)) { Detach(g_od, "read failed"); return; }
-            if (std::memcmp(r0, r1, BarBytes) != 0) {
+            if (!DbgRead(g_od.h, r0, va, BarBytes)) { Detach(g_od, "read failed"); return; }
+            if (Fnv(r0, BarBytes) != h) {
                 /* being drawn: it still changes, so what shows stays up */
                 if (pub & 2) { g_bar_change_tick.store(armGetSystemTick(), std::memory_order_relaxed); }
                 return;
@@ -279,7 +280,7 @@ namespace ams::mitm::applet {
 
         /* Tesla: while it presents, its last queued buffer 10 times a second */
         constinit u32 g_tesla_gen_seen = 0, g_tesla_hash = 0;
-        constinit u64 g_tesla_next_ns = 0;
+        constinit u64 g_tesla_next_ns = 0, g_tesla_busy_until = 0;
         void StepTesla() {
             const u64 age = AgoNs(g_tesla_present_tick.load(std::memory_order_relaxed));
             if (age > UINT64_C(2000000000)) {
@@ -290,7 +291,9 @@ namespace ams::mitm::applet {
             if (age > TeslaHoldNs) { return; }
             const u64 now = NowNs();
             if (now < g_tesla_next_ns) { return; }
-            g_tesla_next_ns = now + UINT64_C(100000000);
+            /* 30 looks a second while the menu is moving (someone navigates
+             * it), 10 while it sits still */
+            g_tesla_next_ns = now + (now < g_tesla_busy_until ? UINT64_C(33000000) : UINT64_C(100000000));
             const u32 gen = g_tesla_buffers_gen.load(std::memory_order_relaxed);
             if (g_tesla.h != svc::InvalidHandle && gen != g_tesla_gen_seen) {
                 /* new buffers: find them again */
@@ -302,23 +305,19 @@ namespace ams::mitm::applet {
             const u32 slot = g_tesla_slot.load(std::memory_order_relaxed) & 1;
             const u64 src = g_tesla.base + slot * TeslaSrcBuf;
             u8 *in = g_cached + CachedTeslaIn, *out = g_cached + CachedTeslaOut;
-            /* a menu sits still most of the time: compare first, convert only
-             * a changed picture */
-            u32 h = 2166136261u;
-            for (u32 r = 0; r < 6; ++r) {
-                if (!DbgRead(g_tesla.h, in, src + r * TeslaSrcRow, TeslaSrcRow)) { Detach(g_tesla, "read failed"); return; }
-                h = (h ^ Fnv(in, TeslaSrcRow)) * 16777619u;
-                Pump(g_tesla);
-            }
+            /* a menu sits still most of the time: one read, and a conversion
+             * only when the picture changed */
+            if (!DbgRead(g_tesla.h, in, src, TeslaSrcBuf)) { Detach(g_tesla, "read failed"); return; }
+            Pump(g_tesla);
+            const u32 h = Fnv(in, TeslaSrcBuf);
             const u32 pub = g_tesla_pub.load(std::memory_order_relaxed);
             if ((pub & 2) && h == g_tesla_hash) { return; }
+            g_tesla_busy_until = now + UINT64_C(1000000000);
             const u32 di = (pub & 2) ? ((pub & 1) ^ 1) : 0;
             u8 *dst = g_area + OffTesla[di];
             for (u32 r = 0; r < 6; ++r) {
-                if (!DbgRead(g_tesla.h, in, src + r * TeslaSrcRow, TeslaSrcRow)) { Detach(g_tesla, "read failed"); return; }
-                ConvertTeslaRow(in, out);
+                ConvertTeslaRow(in + r * TeslaSrcRow, out);
                 std::memcpy(dst + r * TeslaDstRow, out, TeslaDstRow);
-                Pump(g_tesla);
             }
             armDCacheFlush(dst, TeslaDstBuf);
             g_tesla_hash = h;
@@ -340,7 +339,6 @@ namespace ams::mitm::applet {
                 /* answer debug events every 10 ms */
                 Pump(g_od);
                 Pump(g_tesla);
-                if ((tick % 10) != 0) { continue; }
                 {
                     std::scoped_lock lk(g_area_lock);
                     if (!g_area_up.load(std::memory_order_relaxed) || !g_calibrated.load(std::memory_order_relaxed)) {
@@ -349,8 +347,8 @@ namespace ams::mitm::applet {
                         continue;
                     }
                     const u64 t0 = NowNs();
-                    StepBar();
-                    StepTesla();
+                    if ((tick % 10) == 0) { StepBar(); }
+                    StepTesla();   /* it keeps its own pace */
                     g_work_ns += NowNs() - t0;
                 }
                 if (NowNs() >= minute) {

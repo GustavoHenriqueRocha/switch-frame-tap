@@ -151,6 +151,7 @@ namespace ams::mitm::applet {
          * Not nvmap-mapped (it must not be). */
         constexpr size_t VicBounceOff = 0x400000;                   /* 2 MB: dmnt:cht read bounce */
         constexpr size_t VicBounceSize = 0x200000;
+        constexpr size_t VicBounceOverlayOff = 0xC0000;            /* v0.7.14: the overlays' cached working memory from here */
         /* the heap held once streaming has started - engine buffers and the above */
         constexpr size_t VicBaseHeap = VicBounceOff + VicBounceSize;
         static_assert(VicBufsEnd <= VicBounceOff);
@@ -1848,9 +1849,9 @@ namespace ams::mitm::applet {
     u8 *VicBounceBuffer() {
         return g_vic_heap != 0 ? reinterpret_cast<u8 *>(g_vic_heap + VicBounceOff) : nullptr;
     }
-    /* v0.7.14: the lower 1 MB - the overlays work in the upper (cached memory;
-     * the buffers the VIC reads are uncached, slow for the CPU) */
-    size_t VicBounceBufferSize() { return VicBounceSize / 2; }
+    /* v0.7.14: the lower 768 KB - the overlays work in the rest (cached
+     * memory; the buffers the VIC reads are uncached, slow for the CPU) */
+    size_t VicBounceBufferSize() { return VicBounceOverlayOff; }
 
     constinit bool g_dump_armed    = false;
     constinit u32  g_probe_delay_s = 120;
@@ -2336,7 +2337,7 @@ namespace ams::mitm::applet {
          * output buffer, which streaming does not use */
         if (dst_addr != 0) {
             OverlayAreaUp(g_vic_dst_buf + DstSize, dst_addr + static_cast<u32>(DstSize), VicDstSize - DstSize,
-                          reinterpret_cast<u8 *>(g_vic_heap + VicBounceOff + VicBounceSize / 2), VicBounceSize / 2);
+                          reinterpret_cast<u8 *>(g_vic_heap + VicBounceOff + VicBounceOverlayOff), VicBounceSize - VicBounceOverlayOff);
         }
         TryDebugCapture(vfd, nvmap_fd, cmd_handle, syncpt, cfg_addr, dst_addr);
         /* M75: gated. This has completed cleanly in every run (its cmdbuf is an
@@ -7373,6 +7374,7 @@ namespace ams::mitm::applet {
                 if ((t4 - t3) > UINT64_C(500000000) || (t6 - t5) > UINT64_C(500000000)) { need_idr = true; ++viewer_gaps; }
 
                 ++done;
+                if (done == 1) { LogDefer(false); }   /* v0.7.14: the hand-over's lines, now the picture is back */
                 ++w_n; w_read += f.rn; w_flush += f.flush_ns; w_vic += f.vic_ns; w_enc += enc_wait; LiveFrameSent(f.rn, f.vic_ns);
                 s_read += f.rn; s_vic += f.vic_ns; s_enc += enc_wait; s_copy += t5 - t4; s_usb += (t4 - t3) + (t6 - t5);
                 s_bytes += bytes;
@@ -7686,6 +7688,12 @@ namespace ams::mitm::applet {
             const u64 fps_x10 = wall ? static_cast<u64>(sent) * UINT64_C(10000000000) / wall : 0;
             const u64 game_x10 = wall ? static_cast<u64>(presented) * UINT64_C(10000000000) / wall : 0;
             g_streaming_now.store(false, std::memory_order_relaxed);   /* the screen comes back now (screen_off) */
+            /* v0.7.14: a hand-over (the HOME menu to a game, a game to the HOME
+             * menu, a new picture size) - each log line is an SD-card flush
+             * (~40 ms on a full card), and the ~25 lines between this stream
+             * and the next made the viewer wait ~1.4 s (ovl3c). They are held
+             * until the next stream's first frame is out. */
+            if (end == StreamEnd::GameGone || end == StreamEnd::Reconfigure) { LogDefer(true); }
             LogLine("   nvstream: stopped: %s", why);
             if (audio_bytes != 0) {
                 LogLine("   nvstream: game audio %llu KB in %u packets (%llu ms of sound)", static_cast<unsigned long long>(audio_bytes / 1024), audio_seq,
