@@ -3119,10 +3119,23 @@ namespace ams::mitm::applet {
          * game with another layout is reported and skipped. */
         bool FindSwapchainBySize(::ams::svc::Handle dbg, u64 want, u64 *out) {
             u64 addr = 0, best = 0, best_size = ~UINT64_C(0);
+            /* v0.7.14: runs of adjacent device-mapped regions. Pokemon Violet
+             * keeps its buffers in one 280 MB object; after the stream dropped
+             * on a loading screen the re-attach found no region that size or
+             * larger (#20, "swapchain (280363008 B) NOT FOUND") - the game had
+             * changed part of the mapping, splitting the region's entry in two
+             * or more that still sit end to end. */
+            u64 run_base = 0, run_size = 0, run_exact = 0, run_best = 0, run_best_size = ~UINT64_C(0);
+            u32 run_parts = 0, exact_parts = 0;
+            auto end_run = [&]() {
+                if (run_parts > 1 && run_size == want && run_exact == 0) { run_exact = run_base; exact_parts = run_parts; }
+                if (run_parts > 1 && run_size > want && run_size < run_best_size) { run_best = run_base; run_best_size = run_size; }
+                run_size = 0; run_parts = 0;
+            };
             for (u32 steps = 0; steps < 4000; ++steps) {
                 ::ams::svc::MemoryInfo mi = {};
                 ::ams::svc::PageInfo   pi = {};
-                if (!DbgQuery(dbg, std::addressof(mi), std::addressof(pi), addr) || mi.size == 0) { return false; }
+                if (!DbgQuery(dbg, std::addressof(mi), std::addressof(pi), addr) || mi.size == 0) { break; }
                 const u32  attr = static_cast<u32>(mi.attribute);
                 const bool dev  = (attr & ::ams::svc::MemoryAttribute_DeviceShared) != 0 || mi.device_count > 0;
                 if (dev && mi.size == want) { *out = mi.base_address; return true; }
@@ -3131,14 +3144,33 @@ namespace ams::mitm::applet {
                  * and +0x4B0000 of one allocation) - the smallest such block
                  * that can hold them, if no region is exactly their size */
                 if (dev && mi.size > want && mi.size < best_size) { best = mi.base_address; best_size = mi.size; }
+                if (dev) {
+                    if (run_parts == 0 || run_base + run_size != mi.base_address) { end_run(); run_base = mi.base_address; }
+                    run_size += mi.size; ++run_parts;
+                } else {
+                    end_run();
+                }
                 const u64 next = mi.base_address + mi.size;
                 if (next <= addr) { break; }
                 addr = next;
+            }
+            end_run();
+            if (run_exact != 0) {
+                LogLine("   swapchain: %llu B in %u adjacent device-mapped regions at 0x%010llx", static_cast<unsigned long long>(want), exact_parts,
+                        static_cast<unsigned long long>(run_exact));
+                *out = run_exact;
+                return true;
             }
             if (best_size != ~UINT64_C(0)) {
                 LogLine("   swapchain: no region of exactly %llu B; using the smallest device-mapped one that holds it (%llu B)",
                         static_cast<unsigned long long>(want), static_cast<unsigned long long>(best_size));
                 *out = best;
+                return true;
+            }
+            if (run_best_size != ~UINT64_C(0)) {
+                LogLine("   swapchain: no region holds %llu B; using the smallest run of adjacent device-mapped ones that does (%llu B at 0x%010llx)",
+                        static_cast<unsigned long long>(want), static_cast<unsigned long long>(run_best_size), static_cast<unsigned long long>(run_best));
+                *out = run_best;
                 return true;
             }
             return false;
@@ -3209,7 +3241,22 @@ namespace ams::mitm::applet {
                 for (u32 k = 0; k < geo.num_slots && k < 8; ++k) { if (geo.slot_offset[k] > top) { top = geo.slot_offset[k]; } }
                 want = static_cast<u64>(top) + geo.buf_size;
             }
-            return FindSwapchainBySize(dbg, want, base);
+            /* v0.7.14: the same buffer set as the last session (a re-attach
+             * after a drop): where it was, if that is still device-mapped */
+            static u64 s_base = 0, s_want = 0;
+            static u32 s_gen = 0;
+            if (FindSwapchainBySize(dbg, want, base)) { s_base = *base; s_want = want; s_gen = geo.generation; return true; }
+            if (s_base != 0 && s_want == want && s_gen == geo.generation) {
+                ::ams::svc::MemoryInfo mi = {};
+                ::ams::svc::PageInfo   pi = {};
+                if (DbgQuery(dbg, std::addressof(mi), std::addressof(pi), s_base) &&
+                    ((static_cast<u32>(mi.attribute) & ::ams::svc::MemoryAttribute_DeviceShared) != 0 || mi.device_count > 0)) {
+                    LogLine("   swapchain: not found by size - using the last session's address 0x%010llx (the same buffers)", static_cast<unsigned long long>(s_base));
+                    *base = s_base;
+                    return true;
+                }
+            }
+            return false;
         }
 
         /* v0.7.14: the HOME menu or an applet, read out of vi (applet_mitm_uisource.hpp).
