@@ -338,20 +338,16 @@ namespace ams::mitm::applet {
         if (g_armed || probe) { g_ovl_vi_mitm.store(true, std::memory_order_relaxed); }
         if (g_armed) {
             LogLine("overlays: on (overlays.txt) - the volume bar and Tesla/Ultrahand in the stream; Tesla's new vi:m sessions are wrapped (never captured)");
+            SFT_ABORT_UNLESS(os::CreateThread(std::addressof(g_ovl_thread), OverlayThread, nullptr, g_ovl_stack, sizeof(g_ovl_stack), os::GetThreadPriority(os::GetCurrentThread())));
+            os::SetThreadNamePointer(std::addressof(g_ovl_thread), "applet-mitm.Overlays");
+            os::StartThread(std::addressof(g_ovl_thread));
+            NoteThread(std::addressof(g_ovl_thread));
         } else if (probe) {
             LogLine("ovl2: Tesla's new vi:m sessions will be wrapped (counted, never captured)");
         }
     }
 
     bool OverlaysArmed() { return g_armed; }
-
-    void OverlayStart() {
-        if (!g_armed) { return; }
-        SFT_ABORT_UNLESS(os::CreateThread(std::addressof(g_ovl_thread), OverlayThread, nullptr, g_ovl_stack, sizeof(g_ovl_stack), os::GetThreadPriority(os::GetCurrentThread())));
-        os::SetThreadNamePointer(std::addressof(g_ovl_thread), "applet-mitm.Overlays");
-        os::StartThread(std::addressof(g_ovl_thread));
-        NoteThread(std::addressof(g_ovl_thread));
-    }
 
     void OverlaySetCalibrated(bool ok) {
         g_calibrated.store(ok, std::memory_order_relaxed);
@@ -386,10 +382,14 @@ namespace ams::mitm::applet {
         const u32 tp = g_tesla_pub.load(std::memory_order_acquire);
         if (n < max && (tp & 2) && AgoNs(g_tesla_present_tick.load(std::memory_order_relaxed)) < TeslaHoldNs) {
             out[n++] = { dev + static_cast<u32>(OffTesla[tp & 1]), TeslaW, TeslaH, vic::PIXFMT_A8R8G8B8, 0, 0 };
+            static bool said = false;
+            if (!said) { said = true; LogLine("overlays: Tesla is in the stream (first frame)"); }
         }
         const u32 bp = g_bar_pub.load(std::memory_order_acquire);
         if (n < max && (bp & 2) && AgoNs(g_bar_change_tick.load(std::memory_order_relaxed)) < BarHoldNs) {
             out[n++] = { dev + static_cast<u32>(OffBar[bp & 1]), BarW, BarH, vic::PIXFMT_A8R8G8B8, 0, 0 };
+            static bool said = false;
+            if (!said) { said = true; LogLine("overlays: the volume bar is in the stream (first frame)"); }
         }
         return n;
     }

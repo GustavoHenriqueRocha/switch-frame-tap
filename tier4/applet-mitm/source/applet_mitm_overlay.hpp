@@ -21,10 +21,11 @@ namespace ams::mitm::applet {
     void OvlNoteTeslaTransaction(u32 code, const void *in, size_t in_size);
 
     /* at startup, before vi:m is registered: overlays.txt (or the overlay
-     * probe's file) turns on the Tesla wrap; overlays.txt the overlays */
+     * probe's file) turns on the Tesla wrap; overlays.txt the overlays and
+     * their thread (ovl3 started the thread before reading the file - it
+     * never ran) */
     void OverlayArm();
     bool OverlaysArmed();
-    void OverlayStart();                 /* the source thread, when armed */
 
     /* the VIC side. The engines lend the overlays a buffer area the VIC can
      * read (cpu/dev), while they are up; Down waits for the source thread to
