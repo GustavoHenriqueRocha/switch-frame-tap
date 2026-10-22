@@ -9,12 +9,13 @@
  * 16-GOB blocks, premultiplied alpha, all zero when hidden); Tesla draws into
  * 2 x 448x720 RGBA4444 (1344 KB, premultiplied). It also found the costs it
  * could not separate: the stream fell to 33-47 fps while it watched
- * overlayDisp, and attaching to Tesla stalled Ultrahand. So, from `start=`
- * seconds after start (probe-ovl.txt, default 360) in 75 s cycles:
- *   overlayDisp, 15 s each: detached / attached reading 8 KB every 200 ms
- *   (is the bar showing?) / plus 64 KB every 50 ms / plus 512 KB every 50 ms;
- *   Tesla, 15 s: attached, debug events answered every 5 ms, its region
- *   hashed every 500 ms.
+ * overlayDisp, and attaching to Tesla stalled Ultrahand. So, once a game is
+ * on screen and streaming, `cycles=` times (probe-ovl.txt, default 4) with
+ * `window=` seconds (default 10) per step:
+ *   overlayDisp: detached / attached reading 8 KB every 200 ms (is the bar
+ *   showing?) / plus 64 KB every 50 ms / plus 512 KB every 50 ms;
+ *   Tesla: attached, debug events answered every 5 ms, its region hashed
+ *   every 500 ms.
  * Every second: the stream's frames, read and VIC time, the probe's own read
  * time and bytes, whether the bar showed, Tesla's vi:m transactions (its new
  * sessions are wrapped with the probe on - counted, never captured).
@@ -54,6 +55,7 @@ namespace ams::mitm::applet {
         constinit u32 g_tesla_logged[16] = {};
         constinit u32 g_saves = 0;
         constinit u64 g_od_base_last = 0, g_tesla_base_last = 0;
+        constinit u32 g_window_s = 10;
 
         bool ProbeOn() {
             fs::FileHandle f;
@@ -61,19 +63,28 @@ namespace ams::mitm::applet {
             fs::CloseFile(f);
             return true;
         }
-        /* "start=N" in probe-ovl.txt: seconds after the module starts */
-        u32 StartDelay() {
-            char t[64] = {};
+        /* "key=N" in probe-ovl.txt, clamped to lo..hi */
+        u32 Setting(const char *key, u32 def, u32 lo, u32 hi) {
+            char t[128] = {};
             fs::FileHandle f;
-            if (R_FAILED(fs::OpenFile(std::addressof(f), ProbeFile, fs::OpenMode_Read))) { return 360; }
+            if (R_FAILED(fs::OpenFile(std::addressof(f), ProbeFile, fs::OpenMode_Read))) { return def; }
             size_t n = 0;
             static_cast<void>(fs::ReadFile(std::addressof(n), f, 0, t, sizeof(t) - 1));
             fs::CloseFile(f);
-            const char *p = std::strstr(t, "start=");
-            if (p == nullptr) { return 360; }
+            const char *p = std::strstr(t, key);
+            if (p == nullptr) { return def; }
             u32 v = 0;
-            for (p += 6; *p >= '0' && *p <= '9'; ++p) { v = v * 10 + static_cast<u32>(*p - '0'); }
-            return v < 40 ? 40 : (v > 3600 ? 3600 : v);
+            for (p += std::strlen(key); *p >= '0' && *p <= '9'; ++p) { v = v * 10 + static_cast<u32>(*p - '0'); }
+            return v < lo ? lo : (v > hi ? hi : v);
+        }
+        /* a game on screen (it presented in the last second) and the stream
+         * sending its frames */
+        bool GameStreaming() {
+            const u32 f0 = g_live_frames.load(std::memory_order_relaxed);
+            os::SleepThread(TimeSpan::FromSeconds(1));
+            const u64 t = g_app_present_tick.load(std::memory_order_relaxed);
+            const bool on_screen = t != 0 && armTicksToNs(armGetSystemTick() - t) < UINT64_C(1000000000);
+            return on_screen && g_live_frames.load(std::memory_order_relaxed) - f0 >= 20;
         }
         u64 NowNs() { return armTicksToNs(armGetSystemTick()); }
         u64 PidOf(u64 program_id) {
@@ -187,7 +198,7 @@ namespace ams::mitm::applet {
         void OverlayDispWindow(Mode mode) {
             const char *tag = ModeName[mode];
             if (mode == Detached) {
-                for (u32 sec = 0; sec < 15; ++sec) {
+                for (u32 sec = 0; sec < g_window_s; ++sec) {
                     const Sec s0 = SecNow();
                     os::SleepThread(TimeSpan::FromSeconds(1));
                     SecLog(tag, sec, s0, Cost{}, -1, "");
@@ -195,11 +206,11 @@ namespace ams::mitm::applet {
                 return;
             }
             const u64 pid = PidOf(OverlayDispProgramId);
-            if (pid == 0) { LogLine("ovl2: overlayDisp is not running"); os::SleepThread(TimeSpan::FromSeconds(15)); return; }
+            if (pid == 0) { LogLine("ovl2: overlayDisp is not running"); os::SleepThread(TimeSpan::FromSeconds(g_window_s)); return; }
             svc::Handle h = svc::InvalidHandle;
             if (const Result rc = svc::DebugActiveProcess(std::addressof(h), pid); R_FAILED(rc)) {
                 LogLine("ovl2: overlayDisp - DebugActiveProcess rc=0x%x", rc.GetValue());
-                os::SleepThread(TimeSpan::FromSeconds(15));
+                os::SleepThread(TimeSpan::FromSeconds(g_window_s));
                 return;
             }
             u32 nev = 0;
@@ -218,7 +229,7 @@ namespace ams::mitm::applet {
             u64 bulk_off = 0;
             int last_vis = 0;
             const u64 t_start = NowNs();
-            for (u32 sec = 0; sec < 15 && found; ++sec) {
+            for (u32 sec = 0; sec < g_window_s && found; ++sec) {
                 const Sec s0 = SecNow();
                 Cost c;
                 int vis = 0;
@@ -248,7 +259,7 @@ namespace ams::mitm::applet {
         void TeslaWindow() {
             const u64 pid = PidOf(TeslaProgramId);
             if (pid == 0) {
-                for (u32 sec = 0; sec < 15; ++sec) {
+                for (u32 sec = 0; sec < g_window_s; ++sec) {
                     const Sec s0 = SecNow();
                     os::SleepThread(TimeSpan::FromSeconds(1));
                     SecLog("tesla-off", sec, s0, Cost{}, -1, "");
@@ -258,7 +269,7 @@ namespace ams::mitm::applet {
             svc::Handle h = svc::InvalidHandle;
             if (const Result rc = svc::DebugActiveProcess(std::addressof(h), pid); R_FAILED(rc)) {
                 LogLine("ovl2: tesla - DebugActiveProcess rc=0x%x", rc.GetValue());
-                os::SleepThread(TimeSpan::FromSeconds(15));
+                os::SleepThread(TimeSpan::FromSeconds(g_window_s));
                 return;
             }
             u32 nev = 0;
@@ -277,7 +288,7 @@ namespace ams::mitm::applet {
             const u32 nb = found ? static_cast<u32>(((size + Block - 1) / Block) < MaxBlocks ? (size + Block - 1) / Block : MaxBlocks) : 0;
             bool first_hash = true, saved = false;
             const u64 t_start = NowNs();
-            for (u32 sec = 0; sec < 15; ++sec) {
+            for (u32 sec = 0; sec < g_window_s; ++sec) {
                 const Sec s0 = SecNow();
                 Cost c;
                 u32 changed = 0;
@@ -317,11 +328,19 @@ namespace ams::mitm::applet {
         void ProbeThread(void *) {
             os::SleepThread(TimeSpan::FromSeconds(40));
             if (!ProbeOn()) { return; }
-            const u32 start = StartDelay();
+            const u32 cycles = Setting("cycles=", 4, 1, 20);
+            g_window_s = Setting("window=", 10, 5, 30);
             static_cast<void>(fs::CreateDirectory(ProbeDir));
-            LogLine("ovl2: on (probe 2) - from %u s after start, 10 cycles of 75 s: overlayDisp detached / idle / light / heavy, then Tesla", start);
-            os::SleepThread(TimeSpan::FromSeconds(start > 40 ? start - 40 : 0));
-            for (u32 cycle = 0; cycle < 10; ++cycle) {
+            LogLine("ovl2: on (probe 2) - once a game streams, %u cycles of %u s steps: overlayDisp detached / idle / light / heavy, then Tesla", cycles, g_window_s);
+            /* the measurements mean something only with a game streaming: wait
+             * for one (up to 15 minutes), then 5 s for it to settle */
+            u32 waited = 0;
+            while (!GameStreaming()) {
+                if (++waited >= 900) { LogLine("ovl2: no game streamed in 15 minutes - not measuring"); return; }
+            }
+            LogLine("ovl2: a game is streaming - measuring from now (%u s)", cycles * 5 * g_window_s);
+            os::SleepThread(TimeSpan::FromSeconds(5));
+            for (u32 cycle = 0; cycle < cycles; ++cycle) {
                 LogLine("ovl2: cycle %u", cycle);
                 for (u32 m = 0; m < 4; ++m) { OverlayDispWindow(static_cast<Mode>(m)); }
                 TeslaWindow();
