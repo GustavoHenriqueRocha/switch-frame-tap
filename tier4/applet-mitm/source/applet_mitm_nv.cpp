@@ -1064,6 +1064,7 @@ namespace ams::mitm::applet {
             u8 src_c, dst_c, src_a, dst_a;      /* vic::BLEND_* selects */
             bool constant_alpha;                /* PlanarAlpha instead of the pixels' alpha */
             bool slot0_factors;                 /* also give slot 0 explicit replace factors */
+            u8 filter;                          /* FilterLengthX/Y: 0 the default, 2 = 5 taps (a scaled overlay) */
         };
         /* VIC slots 1.. (bottom first); n = 0: slot 0 alone */
         constinit const BlendSlot *g_ovl_slots = nullptr;
@@ -1085,6 +1086,10 @@ namespace ams::mitm::applet {
             slot->DestRectTop         = b.dst_t;
             slot->DestRectBottom      = b.dst_b;
             slot->SoftClampHigh       = 1023;
+            /* v0.7.14: a 720p overlay on a 1080p stream (fake docked) looked
+             * soft and blocky with the default filter (ovl3f) */
+            slot->FilterLengthX       = b.filter;
+            slot->FilterLengthY       = b.filter;
 
             vic::SlotSurfaceConfig *s = std::addressof(c->slotStruct[idx].slotSurfaceConfig);
             s->SlotPixelFormat   = b.src.pixfmt;
@@ -1130,6 +1135,7 @@ namespace ams::mitm::applet {
                 b.dst_r = (r > out.w ? out.w : r) - 1;
                 b.dst_b = (bt > out.h ? out.h : bt) - 1;
                 b.k1 = 1023;
+                b.filter = (b.dst_r + 1 - b.dst_l != p[i].w || b.dst_b + 1 - b.dst_t != p[i].h) ? 2 : 0;   /* scaled: 5 taps */
             }
             return n;
         }
