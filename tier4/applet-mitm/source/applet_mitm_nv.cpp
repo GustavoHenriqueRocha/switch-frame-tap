@@ -53,6 +53,7 @@
 #include "applet_mitm_slotmatch.hpp"
 #include "applet_mitm_idlework.hpp"
 #include "applet_mitm_ovlprobe.hpp"
+#include "applet_mitm_overlay.hpp"
 #include <atomic>
 #include <cstring>
 #include <cstdio>
@@ -1063,10 +1064,13 @@ namespace ams::mitm::applet {
             bool constant_alpha;                /* PlanarAlpha instead of the pixels' alpha */
             bool slot0_factors;                 /* also give slot 0 explicit replace factors */
         };
-        constinit const BlendSlot *g_slot1 = nullptr;
+        /* VIC slots 1.. (bottom first); n = 0: slot 0 alone */
+        constinit const BlendSlot *g_ovl_slots = nullptr;
+        constinit u32 g_ovl_nslots = 0;
+        constexpr u32 MaxOverlaySlots = 2;
 
-        void FillSlot1(vic::VicConfigStruct *c, const BlendSlot &b) {
-            vic::SlotConfig *slot = std::addressof(c->slotStruct[1].slotConfig);
+        void FillSlot(vic::VicConfigStruct *c, u32 idx, const BlendSlot &b) {
+            vic::SlotConfig *slot = std::addressof(c->slotStruct[idx].slotConfig);
             slot->SlotEnable          = 1;
             slot->CurrentFieldEnable  = 1;
             slot->PlanarAlpha         = 1023;
@@ -1081,7 +1085,7 @@ namespace ams::mitm::applet {
             slot->DestRectBottom      = b.dst_b;
             slot->SoftClampHigh       = 1023;
 
-            vic::SlotSurfaceConfig *s = std::addressof(c->slotStruct[1].slotSurfaceConfig);
+            vic::SlotSurfaceConfig *s = std::addressof(c->slotStruct[idx].slotSurfaceConfig);
             s->SlotPixelFormat   = b.src.pixfmt;
             s->SlotBlkKind       = b.src.blk_kind;
             s->SlotBlkHeight     = b.src.blk_h_log2;
@@ -1093,7 +1097,7 @@ namespace ams::mitm::applet {
             s->SlotChromaWidth   = 16383;
             s->SlotChromaHeight  = 16383;
 
-            vic::BlendingSlotStruct *bl = std::addressof(c->slotStruct[1].blendingSlotStruct);
+            vic::BlendingSlotStruct *bl = std::addressof(c->slotStruct[idx].blendingSlotStruct);
             bl->AlphaK1 = b.k1;
             bl->SrcFactCMatchSelect = b.src_c;
             bl->DstFactCMatchSelect = b.dst_c;
@@ -1109,6 +1113,26 @@ namespace ams::mitm::applet {
             }
         }
 
+        /* v0.7.14: the overlays showing now as slots, placed and scaled from a
+         * 1280x720 screen to this output */
+        u32 OverlaySlotsFor(const OutDesc &out, BlendSlot *ov) {
+            OverlayPlane p[MaxOverlaySlots];
+            const u32 n = OverlayPlanes(p, MaxOverlaySlots);
+            for (u32 i = 0; i < n; ++i) {
+                BlendSlot &b = ov[i];
+                b = {};
+                b.addr = p[i].dev;
+                b.src = SrcDesc{ p[i].w, p[i].h, p[i].w, vic::BLK_KIND_GENERIC_16Bx2, 4, p[i].fmt, vic::CACHE_WIDTH_64Bx4, p[i].w, p[i].h };
+                const u32 r = (p[i].x + p[i].w) * out.w / 1280, bt = (p[i].y + p[i].h) * out.h / 720;
+                b.dst_l = p[i].x * out.w / 1280;
+                b.dst_t = p[i].y * out.h / 720;
+                b.dst_r = (r > out.w ? out.w : r) - 1;
+                b.dst_b = (bt > out.h ? out.h : bt) - 1;
+                b.k1 = 1023;
+            }
+            return n;
+        }
+
         /* host1x pushbuf: VIC_PUSH_METHOD / VIC_PUSH_BUFFER from libdrm vic.h.
          * Each entry: [INCR(0x10,2)] [method>>2] [value|reloc-placeholder]. */
         constexpr u32 Host1xIncr0x10x2 = (UINT32_C(1) << 28) | (0x10u << 16) | 2u;
@@ -1117,7 +1141,7 @@ namespace ams::mitm::applet {
         constexpr u32 CfgAddrWord = 8, DstAddrWord = 11, SrcAddrWord = 14;   /* + 1 if SETCL is emitted */
 
         u32 BuildCmdbuf(u32 *w, VicJob job, u32 cfg_addr, u32 dst_addr, u32 src_addr, bool set_class,
-                        u32 chroma_addr = 0, u32 slot1_addr = 0) {
+                        u32 chroma_addr = 0, const BlendSlot *slots = nullptr, u32 nslots = 0) {
             const bool has_src  = (job == VicJob::BlitSelf || job == VicJob::BlitGame || job == VicJob::BlitStrip);
             u32 n = 0;
             /* Point the channel at the VIC's register space before touching
@@ -1143,10 +1167,10 @@ namespace ams::mitm::applet {
                 w[n++] = Host1xIncr0x10x2; w[n++] = vic::SET_SURFACE0_SLOT0_LUMA_OFFSET >> 2;
                 w[n++] = src_addr >> 8;
             }
-            /* v0.7.14 ovl2: the overlay's surface, when slot 1 is on */
-            if (has_src && slot1_addr != 0) {
-                w[n++] = Host1xIncr0x10x2; w[n++] = vic::SlotLumaOffsetMethod(1) >> 2;
-                w[n++] = slot1_addr >> 8;
+            /* v0.7.14: the overlays' surfaces, slots 1.. */
+            for (u32 i = 0; has_src && i < nslots; ++i) {
+                w[n++] = Host1xIncr0x10x2; w[n++] = vic::SlotLumaOffsetMethod(1 + i) >> 2;
+                w[n++] = slots[i].addr >> 8;
             }
             w[n++] = Host1xIncr0x10x2; w[n++] = vic::EXECUTE >> 2; w[n++] = 1u << 8;
             return n;
@@ -1281,12 +1305,14 @@ namespace ams::mitm::applet {
             VicStage(stage);
 
             const bool needs_src = (job == VicJob::BlitSelf || job == VicJob::BlitGame || job == VicJob::BlitStrip);
-            /* v0.7.14 ovl2: and the overlay slot's, when it is on */
-            const BlendSlot *slot1 = (job == VicJob::BlitStrip) ? g_slot1 : nullptr;
-            if (c.cfg_addr == 0 || c.dst_addr == 0 || (needs_src && c.src_addr == 0) || (slot1 != nullptr && slot1->addr == 0)) {
-                LogLine("   [%s] REFUSING to submit: cfg=0x%x dst=0x%x src=0x%x slot1=0x%x - a zero "
+            /* v0.7.14: and the overlay slots' */
+            const u32 nslots = (job == VicJob::BlitStrip && g_ovl_slots != nullptr) ? (g_ovl_nslots < MaxOverlaySlots ? g_ovl_nslots : MaxOverlaySlots) : 0;
+            u32 zero_slot = 0;
+            for (u32 i = 0; i < nslots; ++i) { if (g_ovl_slots[i].addr == 0) { zero_slot = 1 + i; } }
+            if (c.cfg_addr == 0 || c.dst_addr == 0 || (needs_src && c.src_addr == 0) || zero_slot != 0) {
+                LogLine("   [%s] REFUSING to submit: cfg=0x%x dst=0x%x src=0x%x zero slot %u - a zero "
                         "address hangs the VIC and freezes the console",
-                        stage, c.cfg_addr, c.dst_addr, c.src_addr, slot1 != nullptr ? slot1->addr : 0xFFFFFFFFu);
+                        stage, c.cfg_addr, c.dst_addr, c.src_addr, zero_slot);
                 return false;
             }
 
@@ -1312,7 +1338,7 @@ namespace ams::mitm::applet {
                 m.matrix_r_shift = p.shift;
                 m.matrix_enable  = 1;
             }
-            if (slot1 != nullptr) { FillSlot1(cfg, *slot1); }
+            for (u32 i = 0; i < nslots; ++i) { FillSlot(cfg, 1 + i, g_ovl_slots[i]); }
 
             /* pick the OutDesc this job will actually use, so the chroma base
              * matches the config struct we just filled */
@@ -1321,7 +1347,7 @@ namespace ams::mitm::applet {
 
             auto *w = reinterpret_cast<u32 *>(g_vic_cmd_buf);
             u32 words = BuildCmdbuf(w, job, c.cfg_addr, c.dst_addr, c.src_addr + c.src_off, set_class, chroma_addr,
-                                    slot1 != nullptr ? slot1->addr : 0u);
+                                    g_ovl_slots, nslots);
             const u32 rw = set_class ? 1u : 0u;   /* reloc word indices shift when SETCL leads */
             words = AppendIncrSyncpt(w, words, c.syncpt, true);
 
@@ -1588,6 +1614,64 @@ namespace ams::mitm::applet {
             VicStage("csc:done");
         }
 
+        /* ---- v0.7.14: the overlays' blend check ----------------------------
+         * Before overlays are blended into the stream, one VIC job on cards we
+         * own checks what they rely on: the format the stream reads game
+         * frames in (A8R8G8B8 here: memory bytes R,G,B,A) takes alpha from
+         * the last byte, as the overlays store it, and slot 1 lands over
+         * slot 0 with straight alpha. The blend card (ovl2,
+         * logs/v0714-ovl2-run1) found the VIC blends that way whatever the
+         * factor fields say, and that format 33 reads alpha from the first
+         * byte. Overlay bands, 8 rows each: transparent, opaque black, opaque
+         * white, half-transparent white. */
+        bool OverlayBlendCheck(u32 vfd, u32 cmd_handle, u32 syncpt, u32 cfg_addr, u32 dst_addr, u32 self_addr) {
+            constexpr u32 W = 64, H = 32, Stride = 256;
+            constexpr size_t Surf = Stride * 4 * H;
+            static_assert(2 * Surf <= VicSrcSize && Surf <= DstSize);
+            constexpr u8 Band[4][4] = { { 0, 0, 0, 0 }, { 0, 0, 0, 255 }, { 255, 255, 255, 255 }, { 255, 255, 255, 128 } };
+            constexpr u8 Bg[3] = { 40, 120, 200 };
+            u8 *const s0 = g_vic_src_buf, *const s1 = g_vic_src_buf + Surf;
+            std::memset(g_vic_src_buf, 0, 2 * Surf);
+            for (u32 y = 0; y < H; ++y) {
+                for (u32 x = 0; x < W; ++x) {
+                    u8 *p = s0 + y * Stride * 4 + x * 4;
+                    p[0] = Bg[0]; p[1] = Bg[1]; p[2] = Bg[2]; p[3] = 255;
+                    std::memcpy(s1 + y * Stride * 4 + x * 4, Band[y / 8], 4);
+                }
+            }
+            armDCacheFlush(g_vic_src_buf, VicSrcSize);
+            const SrcDesc card{ W, H, Stride, vic::BLK_KIND_PITCH, 0, vic::PIXFMT_A8R8G8B8, vic::CACHE_WIDTH_64Bx4, W, H };
+            g_strip_src = card;
+            g_strip_out = OutDesc{ W, H, Stride, vic::PIXFMT_A8R8G8B8 };
+            g_strip_flip = 0;
+            BlendSlot b = {};
+            b.addr = self_addr + static_cast<u32>(Surf);
+            b.src = card;
+            b.dst_r = W - 1; b.dst_b = H - 1;
+            b.k1 = 1023;
+            g_ovl_slots = std::addressof(b);
+            g_ovl_nslots = 1;
+            std::memset(g_vic_dst_buf, 0xAB, DstSize);
+            const JobCtx ctx{ vfd, cmd_handle, syncpt, cfg_addr, dst_addr, self_addr, 0, 0, 0, 0, SelfSrc };
+            const bool done = RunOneJob("ovl:check", VicJob::BlitStrip, true, ctx);
+            g_ovl_slots = nullptr;
+            g_ovl_nslots = 0;
+            const u8 *o[4];
+            for (u32 band = 0; band < 4; ++band) { o[band] = g_vic_dst_buf + (band * 8 + 4) * Stride * 4 + 32 * 4; }
+            auto near = [](u32 v, u32 want, u32 tol) { return (v > want ? v - want : want - v) <= tol; };
+            bool ok = done;
+            for (u32 c = 0; c < 3; ++c) {
+                ok = ok && near(o[0][c], Bg[c], 3)                                  /* transparent: the background */
+                        && near(o[1][c], 0, 3)                                      /* opaque black */
+                        && near(o[2][c], 255, 3)                                    /* opaque white */
+                        && near(o[3][c], (255 * 128 + Bg[c] * 127) / 255, 4);       /* half white, straight alpha */
+            }
+            LogLine("   overlays: blend check %s - transparent %02x%02x%02x (bg %02x%02x%02x), black %02x%02x%02x, white %02x%02x%02x, half %02x%02x%02x",
+                    !done ? "DID NOT COMPLETE" : (ok ? "passed" : "FAILED"),
+                    o[0][0], o[0][1], o[0][2], Bg[0], Bg[1], Bg[2], o[1][0], o[1][1], o[1][2], o[2][0], o[2][1], o[2][2], o[3][0], o[3][1], o[3][2]);
+            return ok;
+        }
+
 #if SFT_OVL_PROBE
         /* ---- v0.7.14 ovl2: the blend card ---------------------------------
          * Does the VIC blend a second slot over the first, and with which
@@ -1718,12 +1802,14 @@ namespace ams::mitm::applet {
                 else          { b.dst_l = 0; b.dst_t = 0; b.dst_r = BcW - 1; b.dst_b = BcH - 1; }
                 b.k1 = v.k1; b.src_c = v.src_c; b.dst_c = v.dst_c; b.src_a = v.src_a; b.dst_a = v.dst_a;
                 b.constant_alpha = v.constant_alpha; b.slot0_factors = v.slot0_factors;
-                g_slot1 = v.enable ? std::addressof(b) : nullptr;
+                g_ovl_slots = std::addressof(b);
+                g_ovl_nslots = v.enable ? 1 : 0;
                 std::memset(g_vic_dst_buf, 0xAB, DstSize);   /* poison: an untouched output stays 0xAB */
                 char stage[32];
                 std::snprintf(stage, sizeof(stage), "blend:%s", v.name);
                 const bool ok = RunOneJob(stage, VicJob::BlitStrip, true, ctx);
-                g_slot1 = nullptr;
+                g_ovl_slots = nullptr;
+                g_ovl_nslots = 0;
                 if (ok) { ++n_ok; }
 
                 BcFileRec rec = {};
@@ -2226,6 +2312,15 @@ namespace ams::mitm::applet {
         }
 #endif
 
+        /* v0.7.14: the overlays' blend check, at the first setup of the boot */
+        if (OverlaysArmed()) {
+            static bool s_checked = false;
+            if (!s_checked && self_addr != 0 && cfg_addr != 0 && dst_addr != 0 && !g_engine_wedged) {
+                s_checked = true;
+                OverlaySetCalibrated(OverlayBlendCheck(vfd, cmd_handle, syncpt, cfg_addr, dst_addr, self_addr));
+            }
+        }
+
         /* M82: VIC arithmetic on our own buffers, before anything touches the
          * game or another engine */
         if (g_csc_armed && self_addr != 0 && cfg_addr != 0 && dst_addr != 0 && !g_engine_wedged) {
@@ -2235,6 +2330,9 @@ namespace ams::mitm::applet {
         /* M86b: the vi:m indirect-layer probe is a closed route (M47) and
          * touches the display service; live mode skips it */
         if (!g_live_armed) { TryIndirectCapture(); }
+        /* v0.7.14: the overlays' buffers live past the self-tests' 64 KB of our
+         * output buffer, which streaming does not use */
+        if (dst_addr != 0) { OverlayAreaUp(g_vic_dst_buf + DstSize, dst_addr + static_cast<u32>(DstSize), VicDstSize - DstSize); }
         TryDebugCapture(vfd, nvmap_fd, cmd_handle, syncpt, cfg_addr, dst_addr);
         /* M75: gated. This has completed cleanly in every run (its cmdbuf is an
          * IMMEDIATE increment with no engine op), but the point of an observer
@@ -2252,6 +2350,7 @@ namespace ams::mitm::applet {
         if (g_nvjpg_armed) { TryNvjpgProbe(nvmap_fd, cmd_handle, dst_handle); }
 
     close_vic:
+        OverlayAreaDown();   /* waits for the overlays' thread to leave the buffer */
         if (cfg_addr != 0) { UnmapCmdBuffer(vfd, cfg_handle); }
         if (dst_addr != 0) { UnmapCmdBuffer(vfd, dst_handle); }
         if (src_addr != 0)  { UnmapCmdBuffer(vfd, src_handle); }
@@ -6415,7 +6514,12 @@ namespace ams::mitm::applet {
                 if (!size_check_ok) { CropToPresent(g_strip_src); }
                 g_strip_out = Lay().out;
                 g_strip_flip = present_flip;
-                ON_SCOPE_EXIT { g_strip_flip = 0; };
+                /* v0.7.14: the overlays showing now, over the game (not on a
+                 * flipped present: the output flip would mirror them) */
+                BlendSlot ov[MaxOverlaySlots];
+                g_ovl_nslots = present_flip == 0 ? OverlaySlotsFor(g_strip_out, ov) : 0;
+                g_ovl_slots = g_ovl_nslots != 0 ? ov : nullptr;
+                ON_SCOPE_EXIT { g_strip_flip = 0; g_ovl_slots = nullptr; g_ovl_nslots = 0; };
                 JobCtx vc{ vfd, cmd_handle, vsyncpt, cfg_addr, arena_vic + (cur != 0 ? cur : Lay().off_cur), slot_vic, 0, 0, 0, 0, SelfSrc };
                 vc.out_is_dst_buf = false;
                 g_csc_override = std::addressof(NvfBt709);

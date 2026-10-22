@@ -35,7 +35,7 @@
 #include <stratosphere.hpp>
 #include "applet_mitm_uibinder.hpp"
 #include "applet_mitm_uisource.hpp"
-#include "applet_mitm_ovlprobe.hpp"
+#include "applet_mitm_overlay.hpp"
 
 namespace ams::mitm::applet {
     struct DisplayName { char data[0x40]; };
@@ -172,7 +172,7 @@ namespace ams::mitm::applet {
                 const bool applet = g_ui_vi_mitm.load(std::memory_order_relaxed) && IsLibraryApplet(tid);
                 /* v0.7.14: and hbmenu - the homebrew loader in the Album's place - with home_menu on */
                 const bool hbmenu = g_ui_stream_armed && tid == UINT64_C(0x010000000000100D) && client_info.override_status.IsHbl();
-                /* v0.7.14 ovl2: Tesla's sessions, with the overlay probe on (counted, never captured) */
+                /* v0.7.14: Tesla's sessions, with the overlays (or their probe) on - their presents say when it shows; never captured */
                 const bool tesla = tid == TeslaProgramId && g_ovl_vi_mitm.load(std::memory_order_relaxed);
                 return app_range || applet || hbmenu || tesla || IsRunningApplication(client_info.process_id);
             }

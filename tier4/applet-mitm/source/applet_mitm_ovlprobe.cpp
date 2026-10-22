@@ -29,12 +29,11 @@
 #include "applet_mitm_nv.hpp"
 #include "applet_mitm_uibinder.hpp"
 #include "applet_mitm_ovlprobe.hpp"
+#include "applet_mitm_overlay.hpp"
 
 #if SFT_OVL_PROBE
 
 namespace ams::mitm::applet {
-
-    constinit std::atomic<bool> g_ovl_vi_mitm{false};
 
     namespace {
 
@@ -51,8 +50,6 @@ namespace ams::mitm::applet {
         alignas(os::ThreadStackAlignment) constinit u8 g_probe_stack[16_KB];
         constinit os::ThreadType g_probe_thread;
 
-        constinit std::atomic<u32> g_tesla_txns{0}, g_tesla_presents{0};
-        constinit u32 g_tesla_logged[16] = {};
         constinit u32 g_saves = 0;
         constinit u64 g_od_base_last = 0, g_tesla_base_last = 0;
         constinit u32 g_window_s = 10;
@@ -350,23 +347,6 @@ namespace ams::mitm::applet {
 
     }
 
-    void OvlProbeArm() {
-        if (!ProbeOn()) { return; }
-        g_ovl_vi_mitm.store(true, std::memory_order_relaxed);
-        LogLine("ovl2: Tesla's new vi:m sessions will be wrapped (counted, never captured)");
-    }
-
-    void OvlNoteTeslaTransaction(u32 code, const void *in, size_t in_size) {
-        g_tesla_txns.fetch_add(1, std::memory_order_relaxed);
-        if (code == 7) { g_tesla_presents.fetch_add(1, std::memory_order_relaxed); }
-        if (code < 16 && g_tesla_logged[code] < 3) {
-            ++g_tesla_logged[code];
-            s32 slot = -1;
-            if (code == 7) { slot = ParseParcelSlot(static_cast<const u8 *>(in), in_size); }
-            LogLine("ovl2: tesla binder code %u, %zu B in%s%d", code, in_size, code == 7 ? ", queueBuffer slot " : "", code == 7 ? slot : 0);
-        }
-    }
-
     void OvlProbeStart() {
         SFT_ABORT_UNLESS(os::CreateThread(std::addressof(g_probe_thread), ProbeThread, nullptr, g_probe_stack, sizeof(g_probe_stack), os::GetThreadPriority(os::GetCurrentThread())));
         os::SetThreadNamePointer(std::addressof(g_probe_thread), "applet-mitm.OvlProbe");
@@ -380,9 +360,6 @@ namespace ams::mitm::applet {
 
 namespace ams::mitm::applet {
 
-    constinit std::atomic<bool> g_ovl_vi_mitm{false};
-    void OvlProbeArm() { }
-    void OvlNoteTeslaTransaction(u32, const void *, size_t) { }
     void OvlProbeStart() { }
 
 }
