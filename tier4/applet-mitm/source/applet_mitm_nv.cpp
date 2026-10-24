@@ -52,6 +52,8 @@
 #include "applet_mitm_net.hpp"
 #include "applet_mitm_slotmatch.hpp"
 #include "applet_mitm_idlework.hpp"
+#include "sft_frame_timing.h"
+#include "applet_mitm_gop.hpp"
 #include "applet_mitm_ovlprobe.hpp"
 #include "applet_mitm_overlay.hpp"
 #include <atomic>
@@ -1866,6 +1868,30 @@ namespace ams::mitm::applet {
     constinit std::atomic<u32> g_queue_fence_n{0};
     constinit bool g_nvab_armed = false;
     constinit std::atomic<u32> g_early_collect{1};
+    constinit std::atomic<bool> g_frame_timing{true}, g_usb_idle_send{true}, g_present_wake{true};
+    constinit std::atomic<u32> g_usb_gop{240};
+    namespace {
+        constinit os::SdkMutex g_present_wake_lock;
+        constinit os::SdkConditionVariable g_present_wake_cv;
+        /* up to 1 ms for a new present: woken by NotifyPresent, or polled as
+         * before (a broadcast between the check and the wait is caught by
+         * the timeout - never worse than the old 1 ms sleep) */
+        void WaitForPresent(u32 seen) {
+            if (!g_present_wake.load(std::memory_order_relaxed)) { os::SleepThread(TimeSpan::FromMilliSeconds(1)); return; }
+            /* the whole 1 ms unless a present lands: a spurious wake must not
+             * shorten the caller's 50-spin (~50 ms) wait for a new frame */
+            const u64 until = armGetSystemTick() + armNsToTicks(1000000);
+            std::scoped_lock lk(g_present_wake_lock);
+            while (g_queue_count.load(std::memory_order_acquire) == seen) {
+                const u64 now = armGetSystemTick();
+                if (now >= until) { return; }
+                static_cast<void>(g_present_wake_cv.TimedWait(g_present_wake_lock, TimeSpan::FromNanoSeconds(static_cast<s64>(armTicksToNs(until - now)))));
+            }
+        }
+    }
+    void NotifyPresent() {
+        if (g_present_wake.load(std::memory_order_relaxed)) { g_present_wake_cv.Broadcast(); }
+    }
     /* v0.7.14 ovl2: frames the live stream sent and their read and VIC time,
      * for research that measures its own cost per second (the overlay probe) */
     constinit std::atomic<u32> g_live_frames{0};
@@ -6290,6 +6316,9 @@ namespace ams::mitm::applet {
 
             /* M96: how each capture chose its present */
             u32 pick_ready = 0, pick_waited = 0, pick_legacy = 0;
+            /* fork: the last capture's present was already drawn when taken
+             * (its wait then includes the loop being busy, not only the GPU) */
+            bool last_pick_ready = false;
 
             /* M96: read in 2 MB pieces. One 8 MB ReadDebugProcessMemory holds
              * the game's page-table lock for the whole ~8.5 ms copy
@@ -6346,7 +6375,7 @@ namespace ams::mitm::applet {
                 this->HoldForMatch(dbg);
                 for (u32 spins = 0; g_queue_count.load(std::memory_order_acquire) == seen && spins < 50; ++spins) {
                     if (early_poll) { idle_work.Poll(); }
-                    os::SleepThread(TimeSpan::FromMilliSeconds(1));
+                    WaitForPresent(seen);   /* fork: woken by the present (present_wake), else 1 ms as before */
                 }
                 for (u32 retry = 0; ; ) {
                 /* collect before picking a slot: the USB send can block, so
@@ -6369,9 +6398,11 @@ namespace ams::mitm::applet {
                         this->WaitPresentFence(oldest.fence_n, oldest.fence);
                         pick = oldest; have_pick = true;
                         ++pick_waited;
+                        last_pick_ready = false;
                     } else if (have_pick) {
                         ++fence_waits;     /* a wait of 0, so the average stays per capture */
                         ++pick_ready;
+                        last_pick_ready = true;
                     }
                     if (have_pick) {
                         if (dropped != nullptr && pick.count - seen > 1) { *dropped += pick.count - seen - 1; }
@@ -6399,6 +6430,7 @@ namespace ams::mitm::applet {
                 break;
                 }
                 ++pick_legacy;
+                last_pick_ready = false;
                 /* M89: slot and fence as ONE snapshot, taken before the wait.
                  * M88 waited on the fence and only then read the slot; a
                  * present landing during the wait (avg 5.7 ms in MK8) swapped
@@ -7287,7 +7319,7 @@ namespace ams::mitm::applet {
             u64 t_window = loop_t0;
             /* One encode "in flight": submitted, not yet collected. Collecting
              * it waits for NVENC, then sends the frame exactly as before. */
-            struct InFlight { bool active; u32 i; u32 pic; u32 fence; u64 t_submit; bool is_idr; u32 pos; u64 present_ns, rn, vic_ns, t0, t1, flush_ns; };
+            struct InFlight { bool active; u32 i; u32 pic; u32 fence; u64 t_submit; bool is_idr; u32 pos; u64 present_ns, rn, vic_ns, t0, t1, flush_ns; bool ready; };
             u64 w_read = 0, w_flush = 0, w_vic = 0, w_enc = 0, w_fence0 = 0;
             u32 w_n = 0, w_sent0 = 0, w_fwait0 = 0, w_ready0 = 0, w_waited0 = 0, w_drop0 = 0;
             u64 w_t0 = armTicksToNs(armGetSystemTick());
@@ -7311,6 +7343,29 @@ namespace ams::mitm::applet {
              * (VIC, setup), -> noticed encoded, -> sent */
             u64 sp_copied = 0, sp_submit = 0, sp_enc = 0, sp_sent = 0;
             u32 sp_n = 0;
+            /* v0.3: the game audio since the last packet, as its own packet;
+             * only while nothing else is in flight on the endpoint.
+             * flags bit 3: 16-bit stereo PCM; width = rate, height = channels.
+             * false: the send failed (the viewer is gone) */
+            bool audio_sent_early = false;   /* fork: usb_idle_send sent it before this frame's collect */
+            auto send_audio = [&]() -> bool {
+                if (!live || !g_audio_active.load(std::memory_order_relaxed)) { return true; }
+                const size_t an = g_audio_stage != nullptr ? AudioTake(g_audio_stage, AudioStageSize) : 0;
+                if (an == 0) { return true; }
+                SftHdrWire ah = {};
+                ah.magic = 0x52544653u;
+                ah.version = 2;
+                ah.flags = 8;
+                ah.width = 48000; ah.height = 2;
+                ah.length = static_cast<u32>(an);
+                ah.kind = audio_seq++;
+                std::memcpy(g_usb_hdr, std::addressof(ah), sizeof(ah));
+                size_t as = 0;
+                if (!UsbSendBuffer(g_usb_hdr, sizeof(SftHdrWire), std::addressof(as)) ||
+                    !UsbSendBuffer(g_audio_stage, an, std::addressof(as))) { return false; }
+                audio_bytes += an;
+                return true;
+            };
             /* true: stop the loop (why/end set) */
             auto collect = [&](InFlight &f) -> bool {
                 f.active = false;
@@ -7376,26 +7431,10 @@ namespace ams::mitm::applet {
                 }
                 /* v0.3: the game audio since the last frame, as its own packet -
                  * nothing else is in flight on the endpoint at this point.
-                 * flags bit 3: 16-bit stereo PCM; width = rate, height = channels. */
-                if (live && g_audio_active.load(std::memory_order_relaxed)) {
-                    const size_t an = g_audio_stage != nullptr ? AudioTake(g_audio_stage, AudioStageSize) : 0;
-                    if (an != 0) {
-                        SftHdrWire ah = {};
-                        ah.magic = 0x52544653u;
-                        ah.version = 2;
-                        ah.flags = 8;
-                        ah.width = 48000; ah.height = 2;
-                        ah.length = static_cast<u32>(an);
-                        ah.kind = audio_seq++;
-                        std::memcpy(g_usb_hdr, std::addressof(ah), sizeof(ah));
-                        size_t as = 0;
-                        if (!UsbSendBuffer(g_usb_hdr, sizeof(SftHdrWire), std::addressof(as)) ||
-                            !UsbSendBuffer(g_audio_stage, an, std::addressof(as))) {
-                            why = "USB audio send failed (viewer gone?)"; end = StreamEnd::ViewerGone; return true;
-                        }
-                        audio_bytes += an;
-                    }
-                }
+                 * fork: unless it already went while the capture waited for
+                 * this frame's present (usb_idle_send) */
+                if (audio_sent_early) { audio_sent_early = false; }
+                else if (!send_audio()) { why = "USB audio send failed (viewer gone?)"; end = StreamEnd::ViewerGone; return true; }
                 const u64 t4 = armTicksToNs(armGetSystemTick());
                 armDCacheFlush(s.x.a + L.off_bits, bytes);
                 std::memcpy(g_stream_stage[parity] + HdrsLen, s.x.a + L.off_bits, bytes);
@@ -7414,6 +7453,17 @@ namespace ams::mitm::applet {
                 h.stride = static_cast<u32>(age / 1000);               /* M85: console-side age, us */
                 h.length = payload;
                 h.block_h_log2 = 0;
+                /* fork: where the age went (sft_frame_timing.h) - the game's
+                 * share (present -> read starts) apart from the capture's.
+                 * NVENC is submitted -> noticed done (t3): the 720p path
+                 * collects right after submitting, so w0 - t_submit is ~0
+                 * there and the encode itself would land in "send" */
+                if (age != 0 && g_frame_timing.load(std::memory_order_relaxed)) {
+                    const u64 read_t0 = f.t1 > f.rn ? f.t1 - f.rn : f.t1;
+                    h.block_h_log2 = sft_timing_pack(read_t0 > f.present_ns ? read_t0 - f.present_ns : 0, f.rn,
+                                                     f.t_submit > f.t1 ? f.t_submit - f.t1 : 0,
+                                                     t3 > f.t_submit ? t3 - f.t_submit : 0, f.ready ? 1 : 0);
+                }
                 h.kind = f.i;                 /* frame number */
                 std::memcpy(g_usb_hdr, std::addressof(h), sizeof(h));
                 size_t hs = 0;
@@ -7463,6 +7513,26 @@ namespace ams::mitm::applet {
                 if (!fl.active || !NvfPollDone(s.x, fl.pic, fl.fence)) { return false; }
                 if (collect(fl)) { hook_stop = true; }
                 ++early_collects;
+                return true;
+            };
+            /* fork (usb_idle_send): the sequential (720p) path left the
+             * previous frame's transfer and the audio packet to collect(),
+             * between this frame's encode and its header - Run AG: "usb"
+             * 1-2.4 ms a frame, all of it on the console's latency. While the
+             * capture waits for the next present the core is idle anyway:
+             * finish the transfer and send the audio there. */
+            u32 idle_sends = 0;
+            auto usb_hook = [&]() -> bool {
+                if (!pending) { return true; }
+                size_t got = 0;
+                const int r = UsbPollAsync(urb, std::addressof(got));
+                if (r == 0) { return false; }
+                pending = false;
+                if (r < 0) { why = "USB transfer did not complete (viewer gone?)"; end = StreamEnd::ViewerGone; hook_stop = true; return true; }
+                ++sent;
+                if (!send_audio()) { why = "USB audio send failed (viewer gone?)"; end = StreamEnd::ViewerGone; hook_stop = true; return true; }
+                audio_sent_early = true;
+                ++idle_sends;
                 return true;
             };
             /* M97: the overlay's fps readout, refreshed about once a second */
@@ -7535,6 +7605,9 @@ namespace ams::mitm::applet {
                 s.early_poll = early;
                 if (pipe && fl.active) {
                     s.idle_work = { [](void *p) -> bool { return (*static_cast<decltype(hook) *>(p))(); }, std::addressof(hook) };
+                } else if (!pipe && !uvc && !g_tx_net && pending && g_usb_idle_send.load(std::memory_order_relaxed)) {
+                    s.idle_work = { [](void *p) -> bool { return (*static_cast<decltype(usb_hook) *>(p))(); }, std::addressof(usb_hook) };
+                    s.early_poll = true;
                 }
                 const bool got = s.Capture(dbg, slot_base, std::addressof(rn), std::addressof(sg), std::addressof(dropped));
                 if (got && early) { s.idle_work.Poll(); }   /* NVENC done during the copy: send before the VIC */
@@ -7612,12 +7685,21 @@ namespace ams::mitm::applet {
                  * exp/net-ethernet: wired uses 60 so mid-join / seek recovers
                  * faster without the Wi-Fi stall risk. */
                 if (live && g_viewer_key_request.exchange(false, std::memory_order_relaxed)) { need_idr = true; ++key_requests; }
-                const u32 net_gop = g_net_wired.load(std::memory_order_relaxed) ? 60u : 240u;
-                const u32 gop_now = (g_tx_net && gop != 0 && g_viewer_can_ask.load(std::memory_order_relaxed)) ? net_gop : gop;
+                /* fork: over USB nothing is lost either. An IDR at 720p is
+                 * ~15-20 P frames' worth (Run AG: 207 KB vs 10.5 KB): every
+                 * 60 frames it was a once-a-second spike in encode, transfer
+                 * and decode time - applet_mitm_gop.hpp says when it is used */
+                const bool wired = g_net_wired.load(std::memory_order_relaxed);
+                const u32 gop_now = keyframe::Choose(g_tx_net, live, uvc, gop, g_viewer_can_ask.load(std::memory_order_relaxed), wired,
+                                                g_usb_gop.load(std::memory_order_relaxed));
                 if (gop_now != gop && !said_long_gop) {
                     said_long_gop = true;
-                    LogLine("   nvstream: network keyframes on demand + every %u frames (%s; setting: %u)",
-                            net_gop, g_net_wired.load(std::memory_order_relaxed) ? "wired" : "wifi", gop);
+                    if (g_tx_net) {
+                        LogLine("   nvstream: network keyframes on demand + every %u frames (%s; setting: %u)",
+                                gop_now, wired ? "wired" : "wifi", gop);
+                    } else {
+                        LogLine("   nvstream: USB keyframes on demand + every %u frames (setting: %u; usb_keyframe_interval=0 turns this off)", gop_now, gop);
+                    }
                 }
                 if (gop == 0 || need_idr || pos >= gop_now) { pos = 0; }
                 NvfJob j;
@@ -7638,7 +7720,7 @@ namespace ams::mitm::applet {
                     j.me_in  = mes[(pos - 1) & 1];
                     j.me_out = mes[pos & 1];
                 }
-                fl = InFlight{ true, i, pic++, 0, 0, pos == 0, pos, present_ns, rn, t2 - t1, t0, t1, s.last_flush_ns };
+                fl = InFlight{ true, i, pic++, 0, 0, pos == 0, pos, present_ns, rn, t2 - t1, t0, t1, s.last_flush_ns, s.last_pick_ready };
                 if (NvfSubmit(s.x, fl.pic, j, std::addressof(fl.fence), std::addressof(fl.t_submit)) != 0) {
                     fl.active = false; why = "NVENC submit rejected"; end = StreamEnd::Failed; break;
                 }

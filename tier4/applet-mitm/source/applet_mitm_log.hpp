@@ -83,6 +83,9 @@ namespace ams::mitm::applet {
      * The buffer must stay untouched until UsbWaitAsync returns. */
     bool UsbPostAsync(const void *buf, size_t len, u32 *out_urb);
     bool UsbWaitAsync(u32 urb, size_t *out_sent);
+    /* fork (usb_idle_send): UsbWaitAsync without the wait - 1 done (sent),
+     * 0 still in flight, -1 failed. USB only (not the network transport). */
+    int UsbPollAsync(u32 urb, size_t *out_sent);
     /* v0.7.12: the viewer says goodbye ("SFTQ" on the OUT endpoint) when it
      * closes, so a stream ends at once instead of after the 5 s timeout.
      * Called from the stream loop; UsbByeStop at the end of a session. */

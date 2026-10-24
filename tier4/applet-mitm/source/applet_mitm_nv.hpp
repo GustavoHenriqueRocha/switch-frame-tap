@@ -116,6 +116,27 @@ namespace ams::mitm::applet {
     /* (this one and g_detach_on_home are read while a session runs, and the
      * manager's ReloadConfig rewrites them from another thread: atomics) */
     extern std::atomic<u32> g_early_collect;
+    /* fork (melhorias-switch), each with its own switch in config.ini:
+     *  g_frame_timing  - the SFTR header's block_h_log2 carries where the
+     *                    frame's console age went (sft_frame_timing.h);
+     *                    frame_timing=0 (notiming) sends 0 as before
+     *  g_usb_idle_send - 720p (sequential) stream: the previous frame's USB
+     *                    transfer is completed, and the game audio sent,
+     *                    while waiting for the next present, not between the
+     *                    encode and the frame's header; usb_idle_send=0
+     *                    (noidlesend) restores the old order
+     *  g_present_wake  - the capture wakes on the game's queueBuffer instead
+     *                    of polling every 1 ms; present_wake=0 (nopwake)
+     *  g_usb_gop       - live over USB (not the webcam): an IDR every
+     *                    g_usb_gop frames (and on request, SFTK) instead of
+     *                    keyframe_interval, when longer; 0 = off
+     *                    (usb_keyframe_interval in config.ini, usbgop=N;
+     *                    applet_mitm_gop.hpp) */
+    extern std::atomic<bool> g_frame_timing, g_usb_idle_send, g_present_wake;
+    extern std::atomic<u32> g_usb_gop;
+    /* g_present_wake: RecordPresent broadcasts it (no lock taken on the
+     * binder thread); the capture waits on it for at most 1 ms */
+    void NotifyPresent();
     /* v0.7.14 ovl2: the live stream's sent frames and their read/VIC time (ns), running totals */
     extern std::atomic<u32> g_live_frames;
     extern std::atomic<u64> g_live_read_ns, g_live_vic_ns;

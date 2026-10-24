@@ -195,6 +195,21 @@ int main() {
     ExpectRelease("overlays = 1\n", "vic exec dbg usb live nvqp=20 nvgop=60 wait=20 audio overlays");
     ExpectRelease("overlays = 0\n", "vic exec dbg usb live nvqp=20 nvgop=60 wait=20 audio");
     ExpectRelease("home_menu = 1\noverlays = 1\n", "vic exec dbg usb live nvqp=20 nvgop=60 wait=20 audio homemenu overlays");
+    /* fork (melhorias-switch): the transmission switches - on by default, no token */
+    ExpectRelease("frame_timing = 1\nusb_idle_send = 1\npresent_wake = 1\n", "vic exec dbg usb live nvqp=20 nvgop=60 wait=20 audio");
+    ExpectRelease("frame_timing = 0\n", "vic exec dbg usb live nvqp=20 nvgop=60 wait=20 audio notiming");
+    ExpectRelease("usb_idle_send = 0\npresent_wake = 0\n", "vic exec dbg usb live nvqp=20 nvgop=60 wait=20 audio noidlesend nopwake");
+    ExpectRelease("usb_keyframe_interval = 0\n", "vic exec dbg usb live nvqp=20 nvgop=60 wait=20 audio usbgop=0");
+    ExpectRelease("usb_keyframe_interval = 120\noverlays = 1\n", "vic exec dbg usb live nvqp=20 nvgop=60 wait=20 audio overlays usbgop=120");
+    ExpectRelease("usb_keyframe_interval = 999\n", "vic exec dbg usb live nvqp=20 nvgop=60 wait=20 audio");
+    {
+        const char *arm = "vic exec dbg usb live nvqp=20 nvgop=60 wait=20 audio noidlesend usbgop=0";
+        if (af::Number(arm, std::strlen(arm), "usbgop", 240) != 0) { std::printf("FAIL usbgop=0 not read\n"); ++g_fail; }
+        if (af::Number("vic live", 8, "usbgop", 240) != 240) { std::printf("FAIL usbgop default\n"); ++g_fail; }
+    }
+    ExpectContains("vic live noidlesend nopwake\n", "noidlesend", true);
+    ExpectContains("vic live noidlesend nopwake\n", "nopwake", true);
+    ExpectContains("vic live nopwake\n", "notiming", false);
     ExpectContains("vic live nodethome wait=20\n", "nodethome", true);
     ExpectContains("vic live wait=20\n", "nodethome", false);
 

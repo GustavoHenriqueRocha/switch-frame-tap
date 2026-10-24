@@ -667,6 +667,14 @@ namespace ams {
             return mitm::applet::armfile::Contains(g_arm_buf, g_arm_len, keyword);
         }
 
+        /* fork (melhorias-switch): the transmission switches (applet_mitm_nv.hpp) */
+        void ApplyForkSettings() {
+            mitm::applet::g_frame_timing.store(!mitm::applet::armfile::Contains(g_arm_buf, g_arm_len, "notiming"), std::memory_order_relaxed);
+            mitm::applet::g_usb_idle_send.store(!mitm::applet::armfile::Contains(g_arm_buf, g_arm_len, "noidlesend"), std::memory_order_relaxed);
+            mitm::applet::g_present_wake.store(!mitm::applet::armfile::Contains(g_arm_buf, g_arm_len, "nopwake"), std::memory_order_relaxed);
+            mitm::applet::g_usb_gop.store(mitm::applet::armfile::Number(g_arm_buf, g_arm_len, "usbgop", 240), std::memory_order_relaxed);
+        }
+
         /* the per-session settings, from the (re)loaded tokens */
         void ApplySessionSettings() {
             mitm::applet::g_nvstream_qp   = mitm::applet::armfile::Number(g_arm_buf, g_arm_len, "nvqp", 20);
@@ -687,6 +695,7 @@ namespace ams {
             g_screen_off.store(mitm::applet::armfile::Contains(g_arm_buf, g_arm_len, "screenoff"), std::memory_order_relaxed);
             mitm::applet::g_early_collect = mitm::applet::armfile::Contains(g_arm_buf, g_arm_len, "earlyoff") ? 0
                                           : mitm::applet::armfile::Contains(g_arm_buf, g_arm_len, "earlyab") ? 2 : 1;
+            ApplyForkSettings();
         }
 
         /* Numeric option out of the arm file: "wait=180" delays the probe so
@@ -1176,6 +1185,7 @@ namespace ams {
         mitm::applet::g_ui_stream_armed = ArmFileContains("homemenu");   /* v0.7.14: the HOME menu streams too */
         g_screen_off.store(ArmFileContains("screenoff"), std::memory_order_relaxed);
         mitm::applet::g_early_collect = ArmFileContains("earlyoff") ? 0 : ArmFileContains("earlyab") ? 2 : 1;
+        ApplyForkSettings();
         mitm::applet::g_nv1080_armed  = ArmFileContains("nv1080");
         mitm::applet::g_nv1080_n      = ArmFileNumber("nv1080", 120);
         mitm::applet::g_cap720_armed  = ArmFileContains("cap720");
@@ -1588,6 +1598,21 @@ namespace ams::mitm::applet {
 
         if (out_sent != nullptr) { *out_sent = transferred; }
         return transferred > 0;
+    }
+
+    int UsbPollAsync(u32 urb, size_t *out_sent) {
+        if (out_sent != nullptr) { *out_sent = 0; }
+        if (g_tx_net.load(std::memory_order_relaxed) || ::ams::g_usb_ep_in == nullptr) { return -1; }
+        if (R_FAILED(eventWait(std::addressof(::ams::g_usb_ep_in->CompletionEvent), 0))) { return 0; }   /* not yet */
+        eventClear(std::addressof(::ams::g_usb_ep_in->CompletionEvent));
+        UsbDsReportData report = {};
+        ::Result rc = usbDsEndpoint_GetReportData(::ams::g_usb_ep_in, std::addressof(report));
+        if (R_FAILED(rc)) { LogLine("   usb: poll GetReportData rc=0x%x", rc); return -1; }
+        u32 transferred = 0;
+        rc = usbDsParseReportData(std::addressof(report), urb, nullptr, std::addressof(transferred));
+        if (R_FAILED(rc)) { LogLine("   usb: poll ParseReportData rc=0x%x", rc); return -1; }
+        if (out_sent != nullptr) { *out_sent = transferred; }
+        return transferred > 0 ? 1 : -1;
     }
 
     void SetScreenOffNow(bool on) { ::ams::g_screen_off.store(on, std::memory_order_relaxed); }

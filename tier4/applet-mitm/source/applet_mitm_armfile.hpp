@@ -182,6 +182,20 @@ namespace ams::mitm::applet::armfile {
             if (std::strcmp(v, "0") == 0) { earlyoff = true; }
             else if (std::strcmp(v, "ab") == 0) { earlyab = true; }
         }
+        /* fork (melhorias-switch): the transmission changes, each on by
+         * default and turned off by its key = 0 */
+        bool notiming = false, noidlesend = false, nopwake = false;
+        int usbgop = -1;
+        if (IniValue(ini, n, "frame_timing", v, sizeof(v)) && std::strcmp(v, "0") == 0) { notiming = true; }
+        if (IniValue(ini, n, "usb_idle_send", v, sizeof(v)) && std::strcmp(v, "0") == 0) { noidlesend = true; }
+        if (IniValue(ini, n, "present_wake", v, sizeof(v)) && std::strcmp(v, "0") == 0) { nopwake = true; }
+        if (IniValue(ini, n, "usb_keyframe_interval", v, sizeof(v)) && ParseUnsigned(v, &u) && u <= 250) { usbgop = static_cast<int>(u); }
+        char forkbuf[64] = "";
+        {
+            char g[24] = "";
+            if (usbgop >= 0) { std::snprintf(g, sizeof(g), " usbgop=%d", usbgop); }
+            std::snprintf(forkbuf, sizeof(forkbuf), "%s%s%s%s", notiming ? " notiming" : "", noidlesend ? " noidlesend" : "", nopwake ? " nopwake" : "", g);
+        }
         if (IniValue(ini, n, "connection", v, sizeof(v))) {
             if (std::strcmp(v, "network") == 0) { net = true; uvc = uvcraw = false; }
             else if (std::strcmp(v, "webcam") == 0) { uvc = true; uvcraw = false; net = false; }
@@ -195,11 +209,11 @@ namespace ams::mitm::applet::armfile {
             std::snprintf(shotbuf, sizeof(shotbuf), " shot shotkey=%u%s%s", shotkey, custom, shotalbum ? " shotalbum" : "");
         }
         /* one transport: "usb" (the viewer or, with uvc, the webcam) or "net" */
-        const int w = std::snprintf(out, cap, "vic exec dbg %s live nvqp=%u nvgop=%u wait=%u%s%s%s%s%s%s%s%s%s%s%s%s%s%s",
+        const int w = std::snprintf(out, cap, "vic exec dbg %s live nvqp=%u nvgop=%u wait=%u%s%s%s%s%s%s%s%s%s%s%s%s%s%s%s",
                                     net ? "net" : "usb", qp, gop, wait, cap720 ? " cap720" : "", anyfw ? " anyfw" : "", shotbuf, audio ? " audio" : "",
                                     uvc ? " uvc" : "", uvcraw ? " uvcraw" : "", nvab ? " nvab" : "", nohb ? " nohb" : "",
                                     nodethome ? " nodethome" : "", screenoff ? " screenoff" : "",
-                                    earlyoff ? " earlyoff" : "", earlyab ? " earlyab" : "", homemenu ? " homemenu" : "", overlays ? " overlays" : "");
+                                    earlyoff ? " earlyoff" : "", earlyab ? " earlyab" : "", homemenu ? " homemenu" : "", overlays ? " overlays" : "", forkbuf);
         return (w < 0 || static_cast<size_t>(w) >= cap) ? 0 : static_cast<size_t>(w);
     }
 

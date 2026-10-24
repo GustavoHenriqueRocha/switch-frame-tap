@@ -163,6 +163,7 @@ namespace ams::mitm::applet {
         }
         g_queue_count.fetch_add(1, std::memory_order_release);
         g_queue_seq.fetch_add(1, std::memory_order_release);
+        NotifyPresent();   /* fork: wake the capture now, not at its next 1 ms poll */
     }
 
     /* ---- IHOSBinderDriver: the frame pipeline -------------------------- */
