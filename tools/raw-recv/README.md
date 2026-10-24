@@ -69,6 +69,46 @@ and falls back to X11 only if it cannot start.
 macOS: [Metal FSR 1](METAL-FSR.md) integrates with the Upscaling setting (U);
 F9 selects RCAS strength 40/70/100 percent. Filtering is off by default.
 
+### Fork: the console side (branch `melhorias-switch`)
+
+**What "on the Switch" (`console`) measures:** the game's `queueBuffer` (the
+present, recorded by the vi mitm) -> the frame's header about to go out. It
+is NOT all capture cost: a game queues a frame before its GPU has drawn it,
+and the capture must wait for that fence like the console's own screen does.
+A GPU-bound game (BOTW unlocked, 35-45 fps) spends most of those 45-55 ms
+there. The sysmodule now splits the age in every H.264 header (offset 24,
+`block_h_log2`, unused for H.264 before; `tier4/applet-mitm/source/sft_frame_timing.h`):
+
+    game  = present -> slot read starts (GPU still drawing, or the loop busy:
+            the HUD's "already drawn" share says how often it was the loop)
+    read  = svcReadDebugProcessMemory of the slot (+ cache flush)
+    VIC   = read done -> NVENC submitted (RGBA -> NV12 + setup)
+    enc   = NVENC submitted -> its end noticed
+    send  = the rest: previous USB transfer, audio packet, bitstream copy
+
+raw-view shows it in the full HUD (`game / capture`, `read VIC enc send`) and
+prints `console split avg ms: ...` every second and at the end. Older viewers
+and the Android app ignore the field.
+
+Switches in `sdmc:/config/switch-frame-tap/config.ini` (all on by default;
+`= 0` turns one off; the manager app rewrites config.ini without them, so a
+setting made there turns them back on):
+
+| key | what | expected |
+|---|---|---|
+| `frame_timing` | the split above | diagnosis only |
+| `usb_idle_send` | 720p: the previous frame's USB transfer is completed and the audio packet sent while waiting for the next present, not between this frame's encode and its header | -1 to -2.5 ms console latency |
+| `present_wake` | the capture wakes on the present (condition variable) instead of polling every 1 ms | -0.5 ms avg, less jitter |
+| `usb_keyframe_interval` | USB keyframes every N frames (default 240, max 250; never shorter than `keyframe_interval`) plus on request (SFTK); raw-view now also asks after a resync | no once-a-second IDR spike (~20x a P frame) |
+
+Considered, not done (risk or no gain at 720p): the VIC reading the game's
+buffer through its nvmap handle (would drop the read and the page-table lock,
+the likely cause of 50-200 ms hitches, but needs the game's handle imported -
+can hang the GPU); pipelining 720p like 1080p (capture is ~5-8 ms of a 16-28
+ms frame: no gain); moving the capture off core 3 / raising its priority
+(competes with the game, IPC starvation risk); rate control over USB (the
+link has room; size is not the latency).
+
 ---
 
 The original raw-frame tooling follows.
