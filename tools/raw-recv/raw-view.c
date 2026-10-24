@@ -25,6 +25,8 @@
  *   ./raw-view --file s.sft --paced --seconds 5   # v0.2: a recording through the LIVE
  *                              # pipeline (reader thread, decoder thread, vsync display)
  *                              # game audio (v0.3) plays on the default sound device; M mutes
+ *   ./raw-view --file s.sft --headless --paced --frames 600 [--hwdec]   # fork: the decode
+ *                              # benchmark - at 60 fps, avg/p99/max per frame (bench-clip.sh)
  *   ./raw-view --file s.sft --paced --seconds 4 --stats full --shot hud.bmp
  *                              # v0.7.2: the stats overlay at a level (off/fps/graphs/full;
  *                              # O or F3 cycles it), and the last frame saved as BMP (tests)
@@ -2413,11 +2415,17 @@ static int run_check(const char *net_host)
     return 0;
 }
 
+static int cmp_float(const void *a, const void *b)
+{
+    const float x = *(const float *)a, y = *(const float *)b;
+    return x < y ? -1 : x > y;
+}
+
 int main(int argc, char **argv)
 {
     int swap_rb = 0, scale = 1, headless = 0, low_latency = 1, threads = 2;   /* v0.7.11: one decode thread unless --threads */
     long max_frames = 0;
-    int check = 0;
+    int check = 0, hwdec_cli = 0;
     const char *file = NULL, *record = NULL, *h264_out = NULL, *net_host = NULL;
 #ifndef _WIN32
     signal(SIGPIPE, SIG_IGN);          /* v0.7.13: the viewer sends (key_request); a closed socket must not end it */
@@ -2448,7 +2456,7 @@ int main(int argc, char **argv)
         else if (!strcmp(argv[i], "--upscaler") && i + 1 < argc) up_set_by_key(argv[++i]);
         else if (!strcmp(argv[i], "--software")) g_hwdec = 0;
         else if (!strcmp(argv[i], "--picture") && i + 1 < argc) pic_parse(argv[++i]);   /* v0.7.12: B,C,S,G,SH as in viewer.ini (tests) */
-        else if (!strcmp(argv[i], "--hwdec")) g_hwdec = 1;
+        else if (!strcmp(argv[i], "--hwdec")) { g_hwdec = 1; hwdec_cli = 1; }
         else if (!strcmp(argv[i], "--window") && i + 1 < argc) sscanf(argv[++i], "%dx%d", &g_win_w, &g_win_h);
         else if (!strcmp(argv[i], "--mp4") && i + 1 < argc) g_mp4 = argv[++i];
         else if (!strcmp(argv[i], "--rec-dir") && i + 1 < argc) g_rec_dir = argv[++i];
@@ -2579,7 +2587,7 @@ int main(int argc, char **argv)
 #ifdef SFT_H264
     /* v0.2 test3: live USB goes through the paced three-thread pipeline;
      * the loop below is file replay (and the tests) */
-    if (g_usb || g_sock != SOCK_BAD || (g_in && g_paced)) {
+    if (g_usb || g_sock != SOCK_BAD || (g_in && g_paced && !headless)) {
         (void)headless; (void)max_frames;
         if (!g_usb && g_sock == SOCK_BAD) reader_start();            /* --paced: the recording goes through the same reader thread */
         return run_live(ctx, win, ren, g_app, low_latency, threads, rec, es);
@@ -2588,7 +2596,9 @@ int main(int argc, char **argv)
 
 #ifdef SFT_H264
     h264_t dec = {0};
-    int dec_ok = (h264_open(&dec, low_latency, threads, 0) == 0);   /* file replay and the tests: software */
+    /* file replay and the tests: software, unless --hwdec is given (the
+     * decode benchmark: --file s.sft --headless --paced --frames 600 --hwdec) */
+    int dec_ok = (h264_open(&dec, low_latency, threads, hwdec_cli) == 0);
     if (!dec_ok) fprintf(stderr, "libavcodec H.264 decoder unavailable - H.264 packets will be skipped\n");
 #endif
 
@@ -2599,7 +2609,9 @@ int main(int argc, char **argv)
     uint32_t last_kind = 0; int have_kind = 0;
     uint64_t bytes = 0;
     Uint64 t_first = 0, t_prev = 0, freq = SDL_GetPerformanceFrequency();
-    double worst_gap = 0.0, dec_ms_total = 0.0;
+    double worst_gap = 0.0, dec_ms_total = 0.0, dec_ms_max = 0.0;
+    static float dec_ms_each[1 << 16];     /* for the 99th percentile (benchmark) */
+    long dec_n = 0;
     /* M85 latency: arrival time of each frame's header, indexed by frame
      * number, so a frame that comes out of the decoder later can be paired
      * with it; and the console's own age of the frame (present -> header). */
@@ -2697,9 +2709,18 @@ int main(int argc, char **argv)
 #ifdef SFT_H264
         if (is_h264) {
             if (!dec_ok) { undecoded++; continue; }
+            if (headless && g_paced) {      /* fork: the console's pace, so the CPU and GPU clock as they do live */
+                static Uint64 t_due = 0;
+                if (!t_due) t_due = SDL_GetPerformanceCounter();
+                while (SDL_GetPerformanceCounter() < t_due) SDL_Delay(1);
+                t_due += freq / 60;
+            }
             Uint64 d0 = SDL_GetPerformanceCounter();
             int got = h264_decode(&dec, payload, (int)hdr.length, (int64_t)hdr.kind);
-            dec_ms_total += (double)(SDL_GetPerformanceCounter() - d0) * 1000.0 / (double)freq;
+            const double dms = (double)(SDL_GetPerformanceCounter() - d0) * 1000.0 / (double)freq;
+            dec_ms_total += dms;
+            if (dms > dec_ms_max) dec_ms_max = dms;
+            if (dec_n < (long)(sizeof(dec_ms_each) / sizeof(dec_ms_each[0]))) dec_ms_each[dec_n++] = (float)dms;
             if (got < 0) { undecoded++; continue; }
             if (got == 0) continue;          /* frame threads still filling up */
             for (int k = 0; k < 3; k++) { planes[k] = dec.frm->data[k]; pitches[k] = dec.frm->linesize[k]; }
@@ -2820,7 +2841,11 @@ int main(int argc, char **argv)
     fprintf(stderr, "\n%ld packets, %ld frames shown/decoded, %ld not decoded, %ld lost (frame-number gaps), %.1f MB",
             packets, frames, undecoded, lost, (double)bytes / 1e6);
     if (frames > 1 && secs > 0) fprintf(stderr, ", %.1f fps, worst gap %.1f ms", frames / secs, worst_gap);
-    if (frames > 0 && dec_ms_total > 0) fprintf(stderr, ", decode avg %.2f ms", dec_ms_total / frames);
+    if (frames > 0 && dec_ms_total > 0) {
+        qsort(dec_ms_each, (size_t)dec_n, sizeof(dec_ms_each[0]), cmp_float);
+        fprintf(stderr, ", decode avg %.2f ms, p99 %.2f ms, max %.2f ms%s", dec_ms_total / frames,
+                dec_n ? dec_ms_each[dec_n * 99 / 100] : 0.0f, dec_ms_max, dec.hwname ? " (GPU)" : "");
+    }
     fprintf(stderr, "\n");
     if (keyframes) fprintf(stderr, "%ld keyframes (IDR), %ld other\n", keyframes, packets - keyframes);
     if (lat_n) fprintf(stderr, "PC latency (header arrival -> on screen): avg %.1f ms, max %.1f ms over %ld frames\n",

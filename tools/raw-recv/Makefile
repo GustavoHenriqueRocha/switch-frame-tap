@@ -38,6 +38,10 @@ raw-view: raw-view.c record.h menu.h hud.h picture.h update.h ../../common/sft_v
 	$(CC) $(CFLAGS) $(VIEW_CFLAGS) -o $@ $< $(CLARITY_OBJ) $(VIEW_LIBS) -lm
 	@echo "raw-view built $(if $(filter 1,$(H264)),WITH,WITHOUT) H.264 (libavcodec)"
 
+# fork: what a frame costs the decoder thread, mode by mode (decbench.c)
+decbench: decbench.c
+	$(CC) $(CFLAGS) $(shell pkg-config --cflags libavcodec libavutil libva) -o $@ $< $(shell pkg-config --libs libavcodec libavutil libva)
+
 # v0.4: webcam-mode check (V4L2 + libavcodec)
 uvc-check: uvc-check.c
 	$(CC) $(CFLAGS) $(shell pkg-config --cflags libavcodec libavutil) -o $@ $< $(shell pkg-config --libs libavcodec libavutil)
