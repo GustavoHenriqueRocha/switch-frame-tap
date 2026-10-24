@@ -44,6 +44,7 @@ run "nvp_check: IDR + P GOP, drift test" python3 tools/nvp_check.py selftest
 run "udev rules that tag uaccess sort before 73-seat-late (70-, not 99-)" bash tools/test/udev_rules_test.sh
 run "raw-view builds (with H.264)" bash -c "make -s -B -C tools/raw-recv raw-view | grep -q 'WITH H.264'"
 run "decode benchmark: --headless --paced --frames, p99; decbench builds" bash tools/test/headless_bench_test.sh
+run "zero-copy VAAPI -> OpenGL builds (and off with ZEROCOPY=0); SFT_GUI_TESTS=1: same colours" bash tools/test/zerocopy_test.sh
 run "stream end to end: console packets -> raw-view -> H.264" python3 tools/sft_stream_test.py
 run "recording: console H.264 + audio -> MP4 (every frame decodes, AAC at 440 Hz)" bash tools/raw-recv/mp4_record_test.sh
 run "sft_tool: stats, gaps, decode check, head, drift test, artifact detector" python3 tools/sft_tool.py selftest

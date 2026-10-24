@@ -30,6 +30,8 @@
  *   ./raw-view --file s.sft --paced --seconds 4 --stats full --shot hud.bmp
  *                              # v0.7.2: the stats overlay at a level (off/fps/graphs/full;
  *                              # O or F3 cycles it), and the last frame saved as BMP (tests)
+ *   ./raw-view --no-zero-copy  # fork: VAAPI frames are copied to memory and uploaded again
+ *                              # (the default on Wayland/EGL draws them straight from the GPU)
  *   ./raw-view --software      # v0.7.11: decode on the CPU, not the GPU's video decoder
  *                              # (viewer.ini hwdec=0 too; the GPU is the default)
  *   ./raw-view --file s.sft --paced --upscaler fsr   # v0.7.11: GPU upscaling (off/fsr/nis;
@@ -488,6 +490,7 @@ static const char *ip_edit_for_menu(void);   /* NULL unless an address is being 
 #include "menu.h"              /* v0.5: the main screen while there is no picture */
 #include "hud.h"               /* v0.7.2: the stats overlay (O / F3) */
 #include "picture.h"           /* v0.7.12: brightness, contrast... (P) */
+#include "zerocopy.h"          /* fork: VAAPI frames drawn without a copy (Linux, EGL) */
 #include "update.h"            /* v0.7.14: the viewer updates itself from GitHub's releases */
 static libusb_device_handle *g_usb = NULL;
 
@@ -1233,6 +1236,7 @@ static int h264_open(h264_t *d, int low_latency, int threads, int hw)
                 d->c->hw_device_ctx = av_buffer_ref(d->hwdev);
                 d->c->opaque = d;
                 d->c->get_format = h264_get_format;
+                d->c->extra_hw_frames = 8;   /* fork: the display queue may hold GPU frames (zerocopy.h) */
             }
             break;
         }
@@ -1289,6 +1293,12 @@ static int h264_decode(h264_t *d, uint8_t *buf, int len, int64_t pts)
     rc = avcodec_receive_frame(d->c, d->frm);
     if (rc == AVERROR(EAGAIN)) return 0;
     if (rc < 0) return rc;
+#ifdef SFT_ZEROCOPY
+    if (g_zc_ready && d->frm->format == AV_PIX_FMT_VAAPI) {   /* fork: stays on the GPU; the display imports it */
+        zc_sync(d->frm);
+        return 1;
+    }
+#endif
     if (d->hwfmt != AV_PIX_FMT_NONE && d->frm->format == d->hwfmt) {   /* back from the GPU, as NV12 */
         av_frame_unref(d->swfrm);
         rc = av_hwframe_transfer_data(d->swfrm, d->frm, 0);
@@ -2057,6 +2067,13 @@ static int run_live(libusb_context *ctx, SDL_Window *win, SDL_Renderer *ren, int
     if (!g_fm) { g_fm = SDL_CreateMutex(); g_f_put = SDL_CreateCond(); }
     rec_init(g_rec_dir, g_mp4);
     if (g_mp4) rec_toggle();
+#ifdef SFT_ZEROCOPY
+    if (dec.hwname && !strcmp(dec.hwname, "vaapi")) {
+        g_zc_ready = zc_probe(ren);
+        if (g_zc_ready) fprintf(stderr, "decode: zero-copy (VAAPI -> EGL/OpenGL, no copy to memory)\n");
+        else fprintf(stderr, "decode: zero-copy unavailable - %s\n", zc.why);
+    }
+#endif
     dec_args_t da = { &dec, rec, es };
     g_dec_stop = 0;
     SDL_Thread *dth = SDL_CreateThread(decoder_main, "decoder", &da);
@@ -2144,7 +2161,26 @@ static int run_live(libusb_context *ctx, SDL_Window *win, SDL_Renderer *ren, int
                 if (tex) SDL_RenderSetLogicalSize(ren, (int)W, (int)H);
                 SDL_SetRenderDrawColor(ren, 0, 0, 0, 255);
             }
-            const int nv12 = show->format == AV_PIX_FMT_NV12;   /* v0.7.11: from the GPU decoder */
+            int zc_drawn = 0;
+#ifdef SFT_ZEROCOPY
+            if (show->format == AV_PIX_FMT_VAAPI) {   /* fork: zerocopy.h */
+                if (g_zc_ready && pic_neutral() && (uint32_t)show->width == W && (uint32_t)show->height == H && tex) {
+                    SDL_RenderClear(ren);
+                    zc_drawn = zc_draw(ren, show, (int)W, (int)H, g_upscaler);
+                    if (!zc_drawn) { g_zc_ready = 0; fprintf(stderr, "\ndecode: zero-copy off - %s\n", zc.why); }
+                }
+                if (!zc_drawn) {                       /* P settings, a new size, or zero-copy failed: to memory */
+                    AVFrame *m = av_frame_alloc();
+                    if (m && av_hwframe_transfer_data(m, show, 0) == 0) {
+                        av_frame_copy_props(m, show);
+                        av_frame_unref(show);
+                        av_frame_move_ref(show, m);
+                    }
+                    av_frame_free(&m);
+                }
+            }
+#endif
+            const int nv12 = show->format == AV_PIX_FMT_NV12 || show->format == AV_PIX_FMT_VAAPI;   /* v0.7.11: from the GPU decoder */
             if (!tex || (uint32_t)show->width != W || (uint32_t)show->height != H || nv12 != tex_nv12) {
                 if (tex) SDL_DestroyTexture(tex);
                 W = (uint32_t)show->width; H = (uint32_t)show->height; tex_nv12 = nv12;
@@ -2158,6 +2194,7 @@ static int run_live(libusb_context *ctx, SDL_Window *win, SDL_Renderer *ren, int
                 SDL_RenderSetLogicalSize(ren, (int)W, (int)H);
                 fprintf(stderr, "\nstream: %ux%u H.264%s\n", W, H, nv12 ? " (NV12)" : "");
             }
+            if (!zc_drawn) {
             uint8_t *pd[3] = { show->data[0], show->data[1], show->data[2] };
             int pl[3] = { show->linesize[0], show->linesize[1], show->linesize[2] };
             pic_apply(pd, pl, (int)W, (int)H, nv12);   /* v0.7.12: P - nothing at the defaults */
@@ -2166,6 +2203,7 @@ static int run_live(libusb_context *ctx, SDL_Window *win, SDL_Renderer *ren, int
             SDL_RenderClear(ren);
             if (!up_draw(ren, pd, pl, (int)W, (int)H, g_upscaler, nv12))   /* v0.7.11: U */
                 SDL_RenderCopy(ren, tex, NULL, NULL);
+            }
             if (rec_active()) {                /* v0.5: shown while recording (not in the file); v0.7.12: with the time */
                 ui_rec_badge(ren, (int)W, (int)H);
                 SDL_SetRenderDrawColor(ren, 0, 0, 0, 255);
@@ -2456,6 +2494,7 @@ int main(int argc, char **argv)
         else if (!strcmp(argv[i], "--upscaler") && i + 1 < argc) up_set_by_key(argv[++i]);
         else if (!strcmp(argv[i], "--software")) g_hwdec = 0;
         else if (!strcmp(argv[i], "--picture") && i + 1 < argc) pic_parse(argv[++i]);   /* v0.7.12: B,C,S,G,SH as in viewer.ini (tests) */
+        else if (!strcmp(argv[i], "--no-zero-copy")) g_zc = 0;      /* fork: VAAPI frames copied back to memory, as upstream */
         else if (!strcmp(argv[i], "--hwdec")) { g_hwdec = 1; hwdec_cli = 1; }
         else if (!strcmp(argv[i], "--window") && i + 1 < argc) sscanf(argv[++i], "%dx%d", &g_win_w, &g_win_h);
         else if (!strcmp(argv[i], "--mp4") && i + 1 < argc) g_mp4 = argv[++i];

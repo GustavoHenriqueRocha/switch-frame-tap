@@ -682,10 +682,13 @@ static void up_bind(int unit, GLuint tex)
 static GLuint fbits(float f) { GLuint u; memcpy(&u, &f, 4); return u; }
 #endif /* non-Metal backends */
 
-/* the frame, upscaled into the window: 1 drawn, 0 not (draw it the usual way) */
-static int up_draw(SDL_Renderer *ren, uint8_t *const data[3], const int linesize[3], int W, int H, int mode, int nv12)
+/* the frame, upscaled into the window: 1 drawn, 0 not (draw it the usual way).
+ * fork: ext = two GL textures already holding Y and UV (zerocopy.h, Linux):
+ * then the frame is always drawn here, upscaled or not */
+static int up_draw_ex(SDL_Renderer *ren, uint8_t *const data[3], const int linesize[3], int W, int H, int mode, int nv12, const GLuint *ext)
 {
     g_up.active = 0;
+    (void)ext;
 #ifdef __APPLE__
     if (mode == UP_OFF) { g_up_why[0] = 0; return 0; }
     int ow = 0, oh = 0;
@@ -703,15 +706,15 @@ static int up_draw(SDL_Renderer *ren, uint8_t *const data[3], const int linesize
 #ifdef _WIN32
     if (mode == UP_RTX) return vsr_draw(ren, data, linesize, W, H, nv12);
 #endif
-    if (mode == UP_OFF) { g_up_why[0] = 0; return 0; }
+    if (mode == UP_OFF && !ext) { g_up_why[0] = 0; return 0; }
     if (!up_init(ren)) return up_skip("unavailable, press U", 0);
-    if (mode == UP_NIS && !g_up.nis_ok) return up_skip("NIS unavailable", 0);
+    if (mode == UP_NIS && !g_up.nis_ok) { up_skip("NIS unavailable", 0); if (!ext) return 0; mode = UP_OFF; }
     int ow = 0, oh = 0;
     SDL_GetRendererOutputSize(ren, &ow, &oh);
     if (W <= 0 || H <= 0 || ow <= 0 || oh <= 0) return 0;
     int vw, vh;                                   /* the picture on screen, letterboxed */
     if ((long)ow * H > (long)oh * W) { vh = oh; vw = (int)((long)oh * W / H); } else { vw = ow; vh = (int)((long)ow * H / W); }
-    if (vw <= W && vh <= H) return up_skip("window too small", 0);
+    if (vw <= W && vh <= H && mode != UP_OFF) { up_skip("window too small", 0); if (!ext) return 0; mode = UP_OFF; }
     const int vx = (ow - vw) / 2, vy = (oh - vh) / 2;
 
     SDL_RenderFlush(ren);
@@ -739,6 +742,11 @@ static int up_draw(SDL_Renderer *ren, uint8_t *const data[3], const int linesize
     }
 
     /* the planes in, the RGB picture out */
+    if (ext) {
+        up_bind(0, ext[0]);
+        up_bind(1, ext[1]);
+        nv12 = 1;
+    } else {
     up_glPixelStorei(GL_UNPACK_ALIGNMENT, 1);
     up_bind(0, g_up.t_y); up_glPixelStorei(GL_UNPACK_ROW_LENGTH, linesize[0]);
     up_glTexSubImage2D(GL_TEXTURE_2D, 0, 0, 0, W, H, GL_RED, GL_UNSIGNED_BYTE, data[0]);
@@ -752,13 +760,25 @@ static int up_draw(SDL_Renderer *ren, uint8_t *const data[3], const int linesize
         up_glTexSubImage2D(GL_TEXTURE_2D, 0, 0, 0, W / 2, H / 2, GL_RED, GL_UNSIGNED_BYTE, data[2]);
     }
     up_glPixelStorei(GL_UNPACK_ROW_LENGTH, 0);
+    }
     up_fbo_target(g_up.t_rgb, W, H);
     up_glUseProgram(g_up.p_yuv);
     up_glUniform2f(up_glGetUniformLocation(g_up.p_yuv, "size"), (float)W, (float)H);
     up_glUniform1i(up_glGetUniformLocation(g_up.p_yuv, "nv12"), nv12);
     up_glDrawArrays(GL_TRIANGLES, 0, 3);
 
-    if (mode == UP_FSR) {
+    if (mode == UP_OFF) {
+        /* ext, not upscaled: the RGB picture scaled onto the screen as SDL would */
+        up_glBindFramebuffer(GL_FRAMEBUFFER, (GLuint)sv.dfbo);
+        up_glViewport(vx, vy, vw, vh);
+        up_glUseProgram(g_up.p_show);
+        up_glUniform4i(up_glGetUniformLocation(g_up.p_show, "vp"), vx, vy, vw, vh);
+        up_bind(0, g_up.t_rgb);
+        up_glDrawArrays(GL_TRIANGLES, 0, 3);
+        up_restore(&sv);
+        if (g_upscaler == UP_OFF) g_up_why[0] = 0;
+        return 1;
+    } else if (mode == UP_FSR) {
         /* EASU into the picture's on-screen size */
         GLuint con[16];
         const float rx = (float)W / vw, ry = (float)H / vh;
@@ -807,6 +827,11 @@ static int up_draw(SDL_Renderer *ren, uint8_t *const data[3], const int linesize
     g_up.active = 1; g_up.out_w = vw; g_up.out_h = vh;
     return 1;
 #endif
+}
+
+static int up_draw(SDL_Renderer *ren, uint8_t *const data[3], const int linesize[3], int W, int H, int mode, int nv12)
+{
+    return up_draw_ex(ren, data, linesize, W, H, mode, nv12, NULL);
 }
 
 /* the note shown when U is pressed */
