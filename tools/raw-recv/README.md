@@ -19,7 +19,45 @@ make                                   # must say "raw-view built WITH H.264"
 ./raw-view --check                     # session, drivers, udev, USB and network
 ./raw-view --check --net 10.0.0.252    # test the Switch's TCP 9950 stream path
 ./raw-view --video-driver wayland      # force wayland (or x11) for one run
+./raw-view --no-zero-copy              # fork: copy VAAPI frames to memory (upstream's path)
+./raw-view --audio-fixed               # fork: upstream's fixed 40 ms sound cushion
 ```
+
+### Fork: Linux viewer measurements (i3-8130U, UHD 620, iHD VAAPI)
+
+Synthetic 1080p60 clips (`bench-clip.sh`: testsrc2 + noise, High, one slice,
+IDR + P, no B - the console's shape), paced at 60 fps. Not live game footage.
+
+| decoder thread, per frame | avg | p99 | max |
+|---|---|---|---|
+| VAAPI + `av_hwframe_transfer_data` (upstream) | 7.1 ms | 12.9 | 19.4 |
+| VAAPI + `vaSyncSurface` only (zero-copy, `zerocopy.h`) | 2.1 ms | 4.8 | 7.2 |
+| software, 1 thread | 6.9 ms | 10.5 | 26.3 |
+
+(`decbench`, 8 Mbps.) In the viewer itself (`--file --paced`, window): decode
+4.70 ms (max 13.2) with the copy, 1.74 ms (max 3.7) zero-copy; same colours.
+
+Kept: zero-copy VAAPI -> EGL/OpenGL (default on Wayland/EGL), the adaptive
+audio cushion (`audiopace.h`, model: 53 -> 6 underruns in 120 s for +12.6 ms
+queued; a clean link stays at 40 ms), the 70- udev rule name.
+
+Tried and dropped (so they are not chased again):
+- `av_hwframe_map` + memcpy instead of `av_hwframe_transfer_data`: faster in
+  `decbench` (6.8 -> 3.9 ms flat, 7.1 -> 5.7 ms paced) but not measurably in
+  the viewer (3 x 1200 frames alternated: 9.65/7.87/8.79 vs 9.07/8.58/8.91 ms).
+- reusing one destination frame for the transfer: 6.68 vs 6.88 ms, no gain.
+- software decoding: no faster than the GPU and worse p99 at 20 Mbps (25.9
+  ms); `AV_CODEC_FLAG2_FAST` no gain; slice threads no gain (the console sends
+  one slice); frame threads cost ~0 per call but hold 1-2 frames (16-33 ms).
+- decoding on the display thread: it is not - `decoder_main` is its own
+  thread; the display only uploads and waits for vsync.
+- trimming the standing display queue (drop a frame after N vsyncs with one
+  waiting): in a model with 30-60 ms link stalls each second, latency 26 ->
+  11-12 ms but skipped frames 1.7 -> 2.8 per second - smoothness lost, kept
+  upstream's cap of two.
+- measuring the display live on a hidden Hyprland workspace: the compositor
+  throttles hidden windows (~19 fps, draw+vsync ~50 ms) - display numbers
+  need a visible window.
 
 `--app` writes `$XDG_STATE_HOME/switch-frame-tap/viewer.log` (normally
 `~/.local/state/switch-frame-tap/viewer.log`), keeping the previous run as
