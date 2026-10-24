@@ -2284,7 +2284,7 @@ static int run_live(libusb_context *ctx, SDL_Window *win, SDL_Renderer *ren, int
                         (double)(now - t_start) / (double)freq, dec / secs, w_shown / secs, w_skipped, mbps,
                         w_lat_n ? w_lat / w_lat_n : 0.0, w_age_n ? w_age / w_age_n : 0.0,
                         dms, s_dec_max, w_shown ? w_draw / w_shown : 0.0, w_gap, w_qmax_seen,
-                        a_kbs, a_q, g_audio_fixed ? 40 : g_ap.target_ms, (long)g_a_underruns, (long)g_a_resyncs, g_mute ? " (muted)" : "");
+                        a_kbs, a_q, (g_audio_fixed || !g_ap_init) ? AP_MIN_MS : g_ap.target_ms, (long)g_a_underruns, (long)g_a_resyncs, g_mute ? " (muted)" : "");
                 {
                     hud_sec hs = { 0 };
                     hs.fps = w_shown / secs; hs.dec_fps = dec / secs; hs.mbps = mbps;
