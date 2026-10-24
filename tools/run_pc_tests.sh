@@ -41,6 +41,7 @@ run "vic_csc: the VIC matrix law, BT.709/601 designs, Run H verifies" python3 to
 run "vic_csc: Run H's 528 values under the law" python3 tools/vic_csc.py verify logs/m82-runH-vic-csc.bin
 run "nvframe_check: layouts, colour, NVENC-read diagnosis, 1080p frame + GOP" python3 tools/nvframe_check.py selftest
 run "nvp_check: IDR + P GOP, drift test" python3 tools/nvp_check.py selftest
+run "udev rules that tag uaccess sort before 73-seat-late (70-, not 99-)" bash tools/test/udev_rules_test.sh
 run "raw-view builds (with H.264)" bash -c "make -s -B -C tools/raw-recv raw-view | grep -q 'WITH H.264'"
 run "stream end to end: console packets -> raw-view -> H.264" python3 tools/sft_stream_test.py
 run "recording: console H.264 + audio -> MP4 (every frame decodes, AAC at 440 Hz)" bash tools/raw-recv/mp4_record_test.sh

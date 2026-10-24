@@ -2321,7 +2321,12 @@ static int run_check(const char *net_host)
            getenv("WAYLAND_DISPLAY") ? getenv("WAYLAND_DISPLAY") : "-",
            getenv("DISPLAY") ? getenv("DISPLAY") : "-");
 #ifndef _WIN32
-    printf("udev rule: %s\n", access("/etc/udev/rules.d/99-switch-frame-tap.rules", R_OK) == 0 ? "installed" : "missing");
+    /* the rule must sort before 73-seat-late.rules, which applies uaccess:
+     * the 99- name of v0.7.15 and older leaves the Switch root-only */
+    if (access("/etc/udev/rules.d/70-switch-frame-tap.rules", R_OK) == 0) printf("udev rule: installed\n");
+    else if (access("/etc/udev/rules.d/99-switch-frame-tap.rules", R_OK) == 0)
+        printf("udev rule: OLD NAME (99-switch-frame-tap.rules is applied after uaccess - rename it to 70-switch-frame-tap.rules)\n");
+    else printf("udev rule: missing\n");
 #endif
 
     if (video_init() == 0) {

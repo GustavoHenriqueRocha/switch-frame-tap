@@ -301,7 +301,7 @@ To build it from source instead (Ubuntu/Debian):
 
 ```bash
 sudo apt install build-essential libusb-1.0-0-dev libsdl2-dev libavcodec-dev libavutil-dev libavformat-dev
-sudo cp tools/raw-recv/99-switch-frame-tap.rules /etc/udev/rules.d/
+sudo cp tools/raw-recv/70-switch-frame-tap.rules /etc/udev/rules.d/
 sudo udevadm control --reload-rules && sudo udevadm trigger
 bash tools/raw-recv/install-launcher.sh
 ```
