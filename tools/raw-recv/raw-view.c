@@ -30,6 +30,8 @@
  *   ./raw-view --file s.sft --paced --seconds 4 --stats full --shot hud.bmp
  *                              # v0.7.2: the stats overlay at a level (off/fps/graphs/full;
  *                              # O or F3 cycles it), and the last frame saved as BMP (tests)
+ *   ./raw-view --audio-fixed   # fork: upstream's fixed 40 ms sound cushion (cleared past
+ *                              # 120 ms); the default adapts it to the link (audiopace.h)
  *   ./raw-view --no-zero-copy  # fork: VAAPI frames are copied to memory and uploaded again
  *                              # (the default on Wayland/EGL draws them straight from the GPU)
  *   ./raw-view --software      # v0.7.11: decode on the CPU, not the GPU's video decoder
@@ -458,11 +460,28 @@ static SDL_AudioDeviceID g_adev = 0;
 static int g_a_paused = 1, g_mute = 0;
 static volatile long g_a_bytes = 0, g_a_resyncs = 0, g_a_underruns = 0;
 
+#include "audiopace.h"         /* fork: the cushion adapts to the link (--audio-fixed: as above) */
+static int g_audio_fixed = 0;
+static apace_t g_ap;
+static int g_ap_init = 0;
+
 static void audio_packet(const uint8_t *d, uint32_t n, uint32_t rate, uint32_t ch)
 {
     if (!g_adev || g_mute || rate != 48000 || ch != 2) return;
     const Uint32 bps = 48000 * 4;
     Uint32 q = SDL_GetQueuedAudioSize(g_adev);
+    if (!g_audio_fixed) {
+        if (!g_ap_init) { apace_init(&g_ap, 0); g_ap_init = 1; }
+        g_ap.paused = g_a_paused;              /* M and the menu pause it too */
+        int pc = 0;
+        const int act = apace_packet(&g_ap, (int)(q * 1000 / bps), (int)(n * 1000 / bps), &pc);
+        if (pc == -1) { SDL_PauseAudioDevice(g_adev, 1); g_a_paused = 1; g_a_underruns++; }
+        if (act == AP_DROP) { g_a_resyncs++; return; }   /* too far ahead of the picture: this packet goes */
+        SDL_QueueAudio(g_adev, d, n);
+        g_a_bytes += n;
+        if (pc == +1) { SDL_PauseAudioDevice(g_adev, 0); g_a_paused = 0; }
+        return;
+    }
     if (!g_a_paused && q == 0) {               /* ran dry: build the cushion again */
         SDL_PauseAudioDevice(g_adev, 1);
         g_a_paused = 1;
@@ -2261,11 +2280,11 @@ static int run_live(libusb_context *ctx, SDL_Window *win, SDL_Renderer *ren, int
                 if (W) SDL_SetWindowTitle(win, title);
                 const double a_kbs = (g_a_bytes - w_a_bytes0) / 1024.0 / secs;
                 const double a_q = g_adev ? SDL_GetQueuedAudioSize(g_adev) / 192.0 : 0.0;
-                fprintf(stderr, "[%7.1f s] decoded %.1f fps, shown %.1f fps, skipped %ld, %.0f Mbps | pc %.1f ms, console %.1f ms | decode %.2f ms (max %.1f), draw+vsync %.1f ms, worst gap %.1f ms, usb queue max %d | audio %.0f KB/s, %.0f ms queued, %ld underruns, %ld resyncs%s\n",
+                fprintf(stderr, "[%7.1f s] decoded %.1f fps, shown %.1f fps, skipped %ld, %.0f Mbps | pc %.1f ms, console %.1f ms | decode %.2f ms (max %.1f), draw+vsync %.1f ms, worst gap %.1f ms, usb queue max %d | audio %.0f KB/s, %.0f ms queued (cushion %d ms), %ld underruns, %ld resyncs%s\n",
                         (double)(now - t_start) / (double)freq, dec / secs, w_shown / secs, w_skipped, mbps,
                         w_lat_n ? w_lat / w_lat_n : 0.0, w_age_n ? w_age / w_age_n : 0.0,
                         dms, s_dec_max, w_shown ? w_draw / w_shown : 0.0, w_gap, w_qmax_seen,
-                        a_kbs, a_q, (long)g_a_underruns, (long)g_a_resyncs, g_mute ? " (muted)" : "");
+                        a_kbs, a_q, g_audio_fixed ? 40 : g_ap.target_ms, (long)g_a_underruns, (long)g_a_resyncs, g_mute ? " (muted)" : "");
                 {
                     hud_sec hs = { 0 };
                     hs.fps = w_shown / secs; hs.dec_fps = dec / secs; hs.mbps = mbps;
@@ -2494,7 +2513,8 @@ int main(int argc, char **argv)
         else if (!strcmp(argv[i], "--upscaler") && i + 1 < argc) up_set_by_key(argv[++i]);
         else if (!strcmp(argv[i], "--software")) g_hwdec = 0;
         else if (!strcmp(argv[i], "--picture") && i + 1 < argc) pic_parse(argv[++i]);   /* v0.7.12: B,C,S,G,SH as in viewer.ini (tests) */
-        else if (!strcmp(argv[i], "--no-zero-copy")) g_zc = 0;      /* fork: VAAPI frames copied back to memory, as upstream */
+        else if (!strcmp(argv[i], "--no-zero-copy")) g_zc = 0;
+        else if (!strcmp(argv[i], "--audio-fixed")) g_audio_fixed = 1;   /* fork: upstream's fixed 40 ms cushion */      /* fork: VAAPI frames copied back to memory, as upstream */
         else if (!strcmp(argv[i], "--hwdec")) { g_hwdec = 1; hwdec_cli = 1; }
         else if (!strcmp(argv[i], "--window") && i + 1 < argc) sscanf(argv[++i], "%dx%d", &g_win_w, &g_win_h);
         else if (!strcmp(argv[i], "--mp4") && i + 1 < argc) g_mp4 = argv[++i];
