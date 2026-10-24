@@ -20,6 +20,7 @@ __pycache__/
 *.ovl
 *.nacp
 dist/
+dist-teste/
 tools/raw-recv/clarity.o
 tools/raw-recv/clarity_shader.h
 *.nro

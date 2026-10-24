@@ -26,6 +26,8 @@ trap 'rm -rf "$tmp"' EXIT
 echo "switch-frame-tap PC-side checks"
 run "arm-file parser (whole tokens, numbers)" \
     bash -c "g++ -std=c++20 -Itier4/applet-mitm/source tier4/applet-mitm/test/armfile_test.cpp -o $tmp/armfile_test && $tmp/armfile_test"
+run "fork: per-frame console timing word (C viewer and C++ sysmodule agree)" \
+    bash -c "gcc -std=c99 -Wall -Wextra -Werror -Itier4/applet-mitm/source tier4/applet-mitm/test/frame_timing_test.c -lm -o $tmp/ft_c && $tmp/ft_c && g++ -std=c++20 -Wall -Wextra -Werror -x c++ -Itier4/applet-mitm/source tier4/applet-mitm/test/frame_timing_test.c -o $tmp/ft_cpp && $tmp/ft_cpp"
 run "version order for the updaters (common/sft_version.h)" \
     bash -c "gcc -std=c99 -Wall common/test/version_test.c -o $tmp/version_test && $tmp/version_test"
 run "early encode collection: pending, ready, once only, cancelled (PR #12)" \
@@ -47,7 +49,7 @@ run "decode benchmark: --headless --paced --frames, p99; decbench builds" bash t
 run "zero-copy VAAPI -> OpenGL builds (and off with ZEROCOPY=0); SFT_GUI_TESTS=1: same colours" bash tools/test/zerocopy_test.sh
 run "audio cushion adapts: 5x fewer underruns on a stalling link, none added on a clean one" \
     bash -c "gcc -std=c99 -O2 -Wall -Wextra tools/raw-recv/test/audiopace_test.c -o $tmp/audiopace_test && $tmp/audiopace_test"
-run "stream end to end: console packets -> raw-view -> H.264" python3 tools/sft_stream_test.py
+run "stream end to end: console packets -> raw-view -> H.264 (+ fork: the console split)" python3 tools/sft_stream_test.py
 run "recording: console H.264 + audio -> MP4 (every frame decodes, AAC at 440 Hz)" bash tools/raw-recv/mp4_record_test.sh
 run "sft_tool: stats, gaps, decode check, head, drift test, artifact detector" python3 tools/sft_tool.py selftest
 run "nvrec: Run E's grc scan decodes as committed" \

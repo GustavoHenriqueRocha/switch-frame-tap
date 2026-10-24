@@ -510,6 +510,29 @@ static const char *ip_edit_for_menu(void);   /* NULL unless an address is being 
 #include "hud.h"               /* v0.7.2: the stats overlay (O / F3) */
 #include "picture.h"           /* v0.7.12: brightness, contrast... (P) */
 #include "zerocopy.h"          /* fork: VAAPI frames drawn without a copy (Linux, EGL) */
+#include "../../tier4/applet-mitm/source/sft_frame_timing.h"   /* fork: where the console's age went */
+
+/* fork (melhorias-switch): the console's split of its own latency, summed
+ * over the frames shown. The game's share is `wait` (present -> the read
+ * starts: the GPU still drawing the frame the game queued); the capture's is
+ * read + VIC + NVENC + send, send being what is left of the age (the
+ * previous USB transfer, the audio packet, the copy). */
+typedef struct { double wait, read, vic, enc, send; long n, ready; } con_split_t;
+static void con_split_add(con_split_t *c, const sft_timing_t *t, double age_ms)
+{
+    double send = age_ms - t->wait_ms - t->read_ms - t->vic_ms - t->enc_ms;
+    if (send < 0) send = 0;                /* the fields are rounded / saturated */
+    c->wait += t->wait_ms; c->read += t->read_ms; c->vic += t->vic_ms; c->enc += t->enc_ms; c->send += send;
+    c->n++; if (t->ready) c->ready++;
+}
+static void con_split_print(const con_split_t *c, const char *lead)
+{
+    if (!c->n) return;
+    const double n = (double)c->n;
+    fprintf(stderr, "%sconsole split avg ms: game (present -> read) %.1f [%ld%% already drawn when taken] | capture %.1f = read %.1f + VIC %.1f + NVENC %.1f + send %.1f (%ld frames)\n",
+            lead, c->wait / n, c->ready * 100 / c->n, (c->read + c->vic + c->enc + c->send) / n,
+            c->read / n, c->vic / n, c->enc / n, c->send / n, c->n);
+}
 #include "update.h"            /* v0.7.14: the viewer updates itself from GitHub's releases */
 static libusb_device_handle *g_usb = NULL;
 
@@ -1945,6 +1968,8 @@ static SDL_cond *g_f_put = NULL;
 static volatile int g_dec_stop = 0;
 static Uint64 g_t_rx[256];           /* header arrival per frame number */
 static double g_age_ms[256];         /* the console's own age of that frame */
+static sft_timing_t g_tm[256];        /* fork: and where that age went (0 in g_tm_ok: an older console) */
+static unsigned char g_tm_ok[256];
 static float g_kb_pts[256], g_dec_pts[256];   /* v0.7.2 overlay: its size, its decode time */
 static unsigned char g_key_pts[256];          /* and whether it was a keyframe */
 
@@ -1977,6 +2002,7 @@ static int decoder_main(void *arg)
         if (hdr.flags & SFT_FLAG_KEY) s_keyframes++;
         g_t_rx[hdr.kind & 255] = t_hdr;
         g_age_ms[hdr.kind & 255] = (hdr.stride != 0 && hdr.stride < 10000000u) ? hdr.stride / 1000.0 : -1.0;
+        g_tm_ok[hdr.kind & 255] = (unsigned char)sft_timing_unpack(hdr.block_h_log2, &g_tm[hdr.kind & 255]);
         if (g_dec_reopen) {                    /* v0.7.12: hardware decoding switched in the drawer */
             g_dec_reopen = 0;
             h264_close(a->dec);
@@ -2106,6 +2132,7 @@ static int run_live(libusb_context *ctx, SDL_Window *win, SDL_Renderer *ren, int
     Uint64 t_prev_show = 0, t_win = t_start, t_menu = 0;
     long shown = 0, skipped = 0, stale = 0;
     double lat_sum = 0, lat_max = 0, age_sum = 0, age_max = 0; long lat_n = 0, age_n = 0;
+    con_split_t w_split = { 0 }, all_split = { 0 };   /* fork: this second's, and the session's */
     /* this second's window */
     long w_shown = 0, w_skipped = 0, w_dec0 = 0, w_lat_n = 0, w_age_n = 0; double w_bytes0 = 0, w_lat = 0, w_age = 0, w_gap = 0, w_draw = 0, w_dec_ms0 = 0;
     int w_qmax_seen = 0;
@@ -2256,6 +2283,7 @@ static int run_live(libusb_context *ctx, SDL_Window *win, SDL_Renderer *ren, int
             const double l = (double)(now - g_t_rx[k]) * 1000.0 / (double)freq;
             if (l >= 0 && l < 5000) { lat_sum += l; lat_n++; w_lat += l; w_lat_n++; if (l > lat_max) lat_max = l; }
             if (g_age_ms[k] >= 0) { age_sum += g_age_ms[k]; age_n++; w_age += g_age_ms[k]; w_age_n++; if (g_age_ms[k] > age_max) age_max = g_age_ms[k]; }
+            if (g_age_ms[k] >= 0 && g_tm_ok[k]) { con_split_add(&w_split, &g_tm[k], g_age_ms[k]); con_split_add(&all_split, &g_tm[k], g_age_ms[k]); }
             {
                 const double gap = t_prev_show ? (double)(now - t_prev_show) * 1000.0 / (double)freq : 0.0;
                 if (gap > w_gap) w_gap = gap;
@@ -2285,8 +2313,15 @@ static int run_live(libusb_context *ctx, SDL_Window *win, SDL_Renderer *ren, int
                         w_lat_n ? w_lat / w_lat_n : 0.0, w_age_n ? w_age / w_age_n : 0.0,
                         dms, s_dec_max, w_shown ? w_draw / w_shown : 0.0, w_gap, w_qmax_seen,
                         a_kbs, a_q, (g_audio_fixed || !g_ap_init) ? AP_MIN_MS : g_ap.target_ms, (long)g_a_underruns, (long)g_a_resyncs, g_mute ? " (muted)" : "");
+                con_split_print(&w_split, "           ");
                 {
                     hud_sec hs = { 0 };
+                    if (w_split.n) {
+                        const double n = (double)w_split.n;
+                        hs.split = 1; hs.con_game = w_split.wait / n;
+                        hs.con_read = w_split.read / n; hs.con_vic = w_split.vic / n; hs.con_enc = w_split.enc / n; hs.con_send = w_split.send / n;
+                        hs.con_ready = (int)(w_split.ready * 100 / w_split.n);
+                    }
                     hs.fps = w_shown / secs; hs.dec_fps = dec / secs; hs.mbps = mbps;
                     hs.pc = w_lat_n ? w_lat / w_lat_n : 0.0; hs.con = w_age_n ? w_age / w_age_n : 0.0;
                     hs.dec_ms = dms; hs.dec_max = s_dec_max; hs.draw_ms = w_shown ? w_draw / w_shown : 0.0; hs.gap_max = w_gap;
@@ -2319,6 +2354,7 @@ static int run_live(libusb_context *ctx, SDL_Window *win, SDL_Renderer *ren, int
                 w_a_bytes0 = g_a_bytes;
                 t_win = now; w_shown = w_skipped = 0; w_dec0 = s_decoded; w_bytes0 = s_bytes; w_dec_ms0 = s_dec_ms;
                 w_lat = w_age = w_gap = w_draw = 0; w_lat_n = w_age_n = 0; s_dec_max = 0; g_qmax = 0; w_qmax_seen = 0;
+                memset(&w_split, 0, sizeof(w_split));
             }
         }
     }
@@ -2334,6 +2370,7 @@ static int run_live(libusb_context *ctx, SDL_Window *win, SDL_Renderer *ren, int
     if (s_keyframes) fprintf(stderr, "%ld keyframes (IDR)\n", (long)s_keyframes);
     if (lat_n) fprintf(stderr, "PC latency (header arrival -> on screen): avg %.1f ms, max %.1f ms\n", lat_sum / lat_n, lat_max);
     if (age_n) fprintf(stderr, "console latency (present -> header sent): avg %.1f ms, max %.1f ms\n", age_sum / age_n, age_max);
+    con_split_print(&all_split, "");
     printf("packets=%ld frames=%ld undecoded=%ld lost=%ld\n", (long)s_packets, (long)s_decoded, (long)s_undecoded, (long)s_lost);
     if (g_a_bytes) fprintf(stderr, "game audio: %.1f MB, %ld underruns, %ld resyncs\n", g_a_bytes / 1e6, (long)g_a_underruns, (long)g_a_resyncs);
     if (g_adev) { SDL_CloseAudioDevice(g_adev); g_adev = 0; }
@@ -2677,6 +2714,7 @@ int main(int argc, char **argv)
     static Uint64 t_rx[256];
     double lat_sum = 0.0, lat_max = 0.0, age_sum = 0.0, age_max = 0.0;
     long lat_n = 0, age_n = 0, keyframes = 0, sessions = 1;
+    con_split_t file_split = { 0 };          /* fork: the console's split, per frame */
     int64_t out_kind = -1;
     /* v0.2: frames decoded but not drawn (a newer one was already waiting),
      * and the time spent drawing - the Windows diagnosis */
@@ -2761,6 +2799,8 @@ int main(int argc, char **argv)
                 const double a = hdr.stride / 1000.0;
                 age_sum += a; age_n++;
                 if (a > age_max) age_max = a;
+                sft_timing_t tm;
+                if (sft_timing_unpack(hdr.block_h_log2, &tm)) con_split_add(&file_split, &tm, a);
             }
         }
 
@@ -2911,6 +2951,7 @@ int main(int argc, char **argv)
                        lat_sum / lat_n, lat_max, lat_n);
     if (age_n) fprintf(stderr, "console latency (present -> header sent): avg %.1f ms, max %.1f ms\n",
                        age_sum / age_n, age_max);
+    con_split_print(&file_split, "");
     if (shown) fprintf(stderr, "drawn %ld, skipped %ld (a newer frame was waiting), draw avg %.2f ms, USB queue max %d of %d\n",
                        shown, skipped, draw_ms_total / shown, g_qmax, QN);
     rec_join();                               /* v0.5: --mp4: finish the file */

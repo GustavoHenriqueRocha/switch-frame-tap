@@ -32,6 +32,9 @@ typedef struct {
     double fps, dec_fps, mbps, pc, con, dec_ms, dec_max, draw_ms, gap_max, a_kbs, a_q;
     long skipped, lost, keyframes, underruns, resyncs, sessions, packets;
     int qmax, w, h, have;
+    /* fork: the console's split (raw-view.c con_split_t), when it sends one */
+    int split, con_ready;
+    double con_game, con_read, con_vic, con_enc, con_send;
 } hud_sec;
 static hud_sec g_hs;
 
@@ -240,7 +243,7 @@ static void hud_draw(SDL_Renderer *ren, int W, int H, const char *conn, const ch
     } else if (g_hud == HUD_FULL) {
         /* numbers on the left, graphs on the right */
         const int lx = 10, ly = 10, lw = 340;
-        ui_rrect(ren, lx, ly, lw, 492, 10, hud_panel);
+        ui_rrect(ren, lx, ly, lw, g_hs.split ? 536 : 492, 10, hud_panel);
         int y = ly + 10;
         #define HUD_ROW(name, ...) do { text_draw(ren, name, lx + 12, y, 16, 0, hud_dim, 0); \
             snprintf(t, sizeof(t), __VA_ARGS__); text_draw(ren, t, lx + lw - 12, y, 16, 1, hud_ink, 2); y += 22; } while (0)
@@ -253,6 +256,10 @@ static void hud_draw(SDL_Renderer *ren, int W, int H, const char *conn, const ch
         HUD_ROW("Bitrate", "%.1f Mbps", g_hs.mbps);
         HUD_ROW("Latency, total", "%.1f ms", g_hs.pc + g_hs.con);
         HUD_ROW("  on the Switch", "%.1f ms", g_hs.con);
+        if (g_hs.split) {   /* fork: the game's share (GPU still drawing) and the capture's */
+            HUD_ROW("    game / capture", "%.1f / %.1f ms", g_hs.con_game, g_hs.con_read + g_hs.con_vic + g_hs.con_enc + g_hs.con_send);
+            HUD_ROW("    read VIC enc send", "%.1f %.1f %.1f %.1f", g_hs.con_read, g_hs.con_vic, g_hs.con_enc, g_hs.con_send);
+        }
         HUD_ROW("  on this PC", "%.1f ms", g_hs.pc);
         HUD_ROW("Decode", "%.2f ms (max %.1f)", g_hs.dec_ms, g_hs.dec_max);
         HUD_ROW("  decoder", "%s", g_dec_mode);

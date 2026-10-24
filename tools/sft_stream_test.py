@@ -53,8 +53,17 @@ def nvenc_frames():
     return out
 
 
-def pack(frame_no, payload):
-    return struct.pack("<IHHIIIIII", 0x52544653, 2, 2, 1280, 720, 0, len(payload), 0, frame_no) + payload
+def timing_word(wait_ms, read_ms, vic_ms, enc_ms, ready):
+    """fork (melhorias-switch): the console's split of its age, packed as
+    tier4/applet-mitm/source/sft_frame_timing.h documents it - written here
+    from the documented layout, not from the header, so the two must agree."""
+    f = lambda v, unit, mx: min(mx, int(round(v / unit)))
+    return (1 << 31) | ((1 << 30) if ready else 0) | f(wait_ms, 0.5, 255) | f(read_ms, 0.1, 255) << 8 \
+        | f(vic_ms, 0.1, 127) << 16 | f(enc_ms, 0.25, 127) << 23
+
+
+def pack(frame_no, payload, age_us=0, timing=0):
+    return struct.pack("<IHHIIIIII", 0x52544653, 2, 2, 1280, 720, age_us, len(payload), timing, frame_no) + payload
 
 
 def main():
@@ -71,7 +80,13 @@ def main():
                 if i == 17:          # a frame the console skipped (encode error)
                     skipped += 1
                     continue
-                f.write(pack(i, hdrs + slices[i % len(slices)]))
+                # frames 0-19: an older console (no age, no split); 20+: age
+                # 40 ms = game 30 + read 2.4 + VIC 0.7 + NVENC 1.5 + send 5.4,
+                # every fourth one already drawn when taken
+                if i < 20:
+                    f.write(pack(i, hdrs + slices[i % len(slices)]))
+                else:
+                    f.write(pack(i, hdrs + slices[i % len(slices)], 40000, timing_word(30.0, 2.4, 0.7, 1.5, i % 4 == 0)))
                 n += 1
         r = subprocess.run([str(VIEW), "--file", str(sft), "--headless", "--h264", str(es)],
                            capture_output=True, text=True, timeout=120)
@@ -79,6 +94,12 @@ def main():
         print(f"raw-view: {last}")
         got = dict(kv.split("=") for kv in last.split())
         assert got == {"packets": str(n), "frames": str(n), "undecoded": "0", "lost": str(skipped)}, (got, r.stderr)
+        split = [l for l in r.stderr.splitlines() if "console split" in l]
+        assert len(split) == 1, r.stderr
+        want = ("game (present -> read) 30.0 [28% already drawn when taken] | capture 10.0 = "
+                "read 2.4 + VIC 0.7 + NVENC 1.5 + send 5.4 (21 frames)")
+        assert want in split[0], (split[0], want)
+        print(f"raw-view: {split[0].strip()}")
 
         import av
         ctx = av.CodecContext.create("h264", "r")
