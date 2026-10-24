@@ -1120,7 +1120,12 @@ static int reader_main(void *arg)
         const int r = read_exact((uint8_t *)&hdr, sizeof(hdr), 100);
         if (r <= 0) continue;
         const Uint64 t = SDL_GetPerformanceCounter();
-        if (hdr.magic != SFT_MAGIC) { fprintf(stderr, "bad magic 0x%08x, resyncing\n", hdr.magic); continue; }
+        /* fork (melhorias-switch): after a resync ask for a keyframe at once -
+         * the bytes skipped may have held a frame, and over USB the console
+         * now spaces keyframes 4 s apart (usb_keyframe_interval) */
+        static int resynced = 0;
+        if (hdr.magic != SFT_MAGIC) { fprintf(stderr, "bad magic 0x%08x, resyncing\n", hdr.magic); resynced = 1; continue; }
+        if (resynced) { resynced = 0; key_request(); }
         if (hdr.length == 0 || hdr.length > 64u*1024*1024) continue;
         if (hdr.flags & SFT_FLAG_AUDIO) {
             static uint8_t abuf[64 * 1024];
