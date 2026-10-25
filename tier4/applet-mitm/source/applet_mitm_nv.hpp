@@ -164,11 +164,12 @@ namespace ams::mitm::applet {
      * locked; ~0: lock at the next session's size; else w << 16 | h. "SFTU",
      * SFTQ or the viewer going away unlock it. */
     extern std::atomic<u32> g_size_lock;
-    bool ViewerLockSize(bool lock);
+    bool ViewerLockSize(bool lock);   /* v0.7.19: true - the session restarts at the locked size (its first frame is a keyframe) */
 /* v0.7.19 research: enlarging alternates the 1-tap and 2-tap VIC filter at each
  * stream window (~20 s) and logs which one the window used - an A/B for the
- * 2-tap's cost. 0 in releases (make_release.sh refuses a probe left on). */
-#define SFT_FILTER_AB_PROBE 0   /* v0.7.19: true - the session restarts at the locked size (its first frame is a keyframe) */
+ * 2-tap's cost (test4-ab: same 60 fps and VIC time, half the bitrate, lower
+ * latency). 0 in releases (make_release.sh refuses a probe left on). */
+#define SFT_FILTER_AB_PROBE 0
     extern std::atomic<u64> g_queue_fence[4];
     /* M89: a seqlock over slot + fence: odd while the binder thread writes */
     extern std::atomic<u32> g_queue_seq;
