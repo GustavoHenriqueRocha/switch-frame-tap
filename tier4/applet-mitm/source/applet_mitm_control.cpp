@@ -118,17 +118,7 @@ namespace ams::mitm::applet {
                     R_SUCCEED();
                 }
                 Result SetAppExcluded(u64 program_id, u8 excluded) {
-                    if (program_id == 0) { R_SUCCEED(); }
-                    {
-                        std::scoped_lock lk(g_excl_lock);
-                        size_t i = 0;
-                        while (i < g_excl_n && g_excl[i] != program_id) { ++i; }
-                        if (excluded && i == g_excl_n && g_excl_n < MaxExcluded) { g_excl[g_excl_n++] = program_id; }
-                        if (!excluded && i < g_excl_n) { g_excl[i] = g_excl[--g_excl_n]; }
-                        SaveExcludedLocked();
-                    }
-                    if (g_app_tid.load(std::memory_order_relaxed) == program_id) { g_app_excluded.store(excluded != 0, std::memory_order_relaxed); }
-                    LogLine("sftap: %016llx %s", static_cast<unsigned long long>(program_id), excluded ? "EXCLUDED - never attached" : "streamed again");
+                    SetExcluded(program_id, excluded != 0);
                     R_SUCCEED();
                 }
         };
@@ -183,6 +173,20 @@ namespace ams::mitm::applet {
         for (size_t k = 0; k < g_excl_n; ++k) { if (g_excl[k] == cur) { ex = true; } }
         g_app_excluded.store(cur != 0 && ex, std::memory_order_relaxed);
         LogLine("sftap: %zu app(s) excluded (never attached)", g_excl_n);
+    }
+
+    void SetExcluded(u64 program_id, bool excluded) {
+        if (program_id == 0) { return; }
+        {
+            std::scoped_lock lk(g_excl_lock);
+            size_t i = 0;
+            while (i < g_excl_n && g_excl[i] != program_id) { ++i; }
+            if (excluded && i == g_excl_n && g_excl_n < MaxExcluded) { g_excl[g_excl_n++] = program_id; }
+            if (!excluded && i < g_excl_n) { g_excl[i] = g_excl[--g_excl_n]; }
+            SaveExcludedLocked();
+        }
+        if (g_app_tid.load(std::memory_order_relaxed) == program_id) { g_app_excluded.store(excluded, std::memory_order_relaxed); }
+        LogLine("sftap: %016llx %s", static_cast<unsigned long long>(program_id), excluded ? "EXCLUDED - never attached" : "streamed again");
     }
 
     bool IsExcluded(u64 program_id) {

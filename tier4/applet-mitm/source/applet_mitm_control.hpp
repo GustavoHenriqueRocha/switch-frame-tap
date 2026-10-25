@@ -50,6 +50,9 @@ namespace ams::mitm::applet {
     void StartControlService();
     /* v0.1.1b: the never-attach list */
     void LoadExcluded();
+    /* v0.7.19: put an app on the never-attach list (or take it off), as the
+     * overlay's "Stream this app" does - the stream's auto-skip uses it */
+    void SetExcluded(u64 program_id, bool excluded);
     bool IsExcluded(u64 program_id);
 
 }

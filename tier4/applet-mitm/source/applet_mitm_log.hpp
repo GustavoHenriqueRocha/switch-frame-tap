@@ -114,6 +114,8 @@ namespace ams::mitm::applet {
         ViewerReason_Starting    = 10,
         /* v0.7.15: the keyboard beside System Settings (no room for a donor) */
         ViewerReason_Keyboard    = 11,
+        /* v0.7.19: a picture above 1080p (Project Diva at 2560x1440, #48) */
+        ViewerReason_TooBig      = 12,
     };
     void SetViewerReason(ViewerReason r);
     /* v0.7.11: USB follows the stream switch (VIC worker thread only) */

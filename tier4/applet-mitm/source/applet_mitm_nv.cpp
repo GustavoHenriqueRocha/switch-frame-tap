@@ -46,6 +46,7 @@
 #include "nvenc_1080p.h"
 #include "applet_mitm_dbgpump.hpp"
 #include "applet_mitm_shot.hpp"
+#include "applet_mitm_control.hpp"
 #include "applet_mitm_donor.hpp"
 #include "applet_mitm_audio.hpp"
 #include "applet_mitm_uvc.hpp"
@@ -1911,6 +1912,9 @@ namespace ams::mitm::applet {
     void ViewerLockSize(bool lock) {
         if (!lock) { g_size_lock.store(0, std::memory_order_relaxed); return; }
         if (g_size_lock.load(std::memory_order_relaxed) != 0) { return; }   /* already: a repeated request */
+        /* v0.7.19: started on the HOME menu (always 720p), a recording is 1080p
+         * - else a 1080p game started from there went into it at 720p (#43) */
+        if (g_ui_session_active.load(std::memory_order_relaxed) && !g_cap720_armed) { g_size_lock.store(1920u << 16 | 1080u, std::memory_order_relaxed); return; }
         const u32 w = g_live_w.load(std::memory_order_relaxed), h = g_live_h.load(std::memory_order_relaxed);
         g_size_lock.store(g_streaming_now.load(std::memory_order_relaxed) && w != 0 ? (w << 16 | h) : ~0u, std::memory_order_relaxed);
     }
@@ -3431,6 +3435,38 @@ namespace ams::mitm::applet {
             }
         }
 
+        /* v0.7.19: an app that closes itself within a few seconds of the stream
+         * attaching - TiCo's protected builds do (anti-debug, #31: its 33
+         * threads gone 2.6 s after the attach, no fault) - goes on the
+         * never-attach list, as "Stream this app" off in the overlay does, so
+         * its next start runs untouched. Not the Homebrew Menu over a game
+         * (hbl runs under the game's program id, which would then be skipped)
+         * nor the Album's homebrew. */
+        constexpr u64 AutoSkipNs = UINT64_C(6000000000);
+        struct AttachRecord { u64 tid; u64 ns; bool candidate; };
+
+        AttachRecord NoteAttach(u64 pid, bool applet_target) {
+            AttachRecord r = { g_app_tid.load(std::memory_order_relaxed), armTicksToNs(armGetSystemTick()), false };
+            if (applet_target || r.tid == 0 || g_pmdmnt_rc != 0) { return r; }
+            os::NativeHandle h = os::InvalidNativeHandle;
+            ncm::ProgramLocation loc = {};
+            cfg::OverrideStatus st = {};
+            if (R_SUCCEEDED(::ams::pm::dmnt::AtmosphereGetProcessInfo(std::addressof(h), std::addressof(loc), std::addressof(st), os::ProcessId{pid}))) {
+                os::CloseNativeHandle(h);
+                r.candidate = !st.IsHbl() && loc.program_id.value == r.tid;
+            }
+            return r;
+        }
+
+        void AutoSkipIfClosedAtOnce(const AttachRecord &a) {
+            const u64 ms = (armTicksToNs(armGetSystemTick()) - a.ns) / UINT64_C(1000000);
+            if (!a.candidate || ms * UINT64_C(1000000) > AutoSkipNs) { return; }
+            SetExcluded(a.tid, true);
+            LogLine("   live: %016llx closed itself %llu ms after the stream attached (anti-debug, as TiCo) - skipped from now on; \"Stream this app\" in the overlay brings it back",
+                    static_cast<unsigned long long>(a.tid), static_cast<unsigned long long>(ms));
+            NotifyShot("This app closed when streamed - it is skipped from now on");
+        }
+
         void RunLive(u32 vfd, u32 nvmap_fd, u32 cmd_handle, u32 syncpt, u32 cfg_addr) {
             LogLine("   ==== LIVE MODE (M86): streaming whenever a viewer is reading and a game is running ====");
             /* M98: a release install captures only on the firmware it was
@@ -3448,6 +3484,7 @@ namespace ams::mitm::applet {
                 }
             }
             u64 skip_pid = 0;          /* a game whose swapchain was not found: wait for another */
+            bool skip_big = false;     /* v0.7.19: ...or that draws above 1080p (#48) */
             u32 skip_gen = 0;          /* v0.7.17: ...or for its next buffer set (PokeMMO: a splash first, its game buffers 7 s later) */
             bool said_wait_viewer = false, said_wait_game = false;
             u64 hidden_since_ns = 0;   /* app alive but not presenting - load vs HOME */
@@ -3578,7 +3615,7 @@ namespace ams::mitm::applet {
                         }
                     }
                     g_live_state.store(LiveState_WaitGame, std::memory_order_relaxed);
-                    SetViewerReason(!have_app ? ViewerReason_NoGame : (pid.value == skip_pid ? ViewerReason_NotFound : ViewerReason_GameHidden));
+                    SetViewerReason(!have_app ? ViewerReason_NoGame : (pid.value == skip_pid ? (skip_big ? ViewerReason_TooBig : ViewerReason_NotFound) : ViewerReason_GameHidden));
                     /* App alive but not presenting: often a load screen, not HOME.
                      * Tear the donor down when HomeDetachShouldFire confirms
                      * (HOME button / Album / applet) or the fallback stall elapses.
@@ -3625,7 +3662,7 @@ namespace ams::mitm::applet {
                     said_hidden_wait = false;
                     if (!said_wait_game) {
                         LogLine("   live: viewer present; waiting for a game (%s)",
-                                !have_app ? "no application" : (pid.value == skip_pid ? "this game's swapchain was not found" : "not presenting"));
+                                !have_app ? "no application" : (pid.value == skip_pid ? (skip_big ? "this game draws above 1080p" : "this game's swapchain was not found") : "not presenting"));
                         VicStage("live:no_game");
                         said_wait_game = true;
                     }
@@ -3702,13 +3739,28 @@ namespace ams::mitm::applet {
                     DbgDetach(dbg);
                     skip_pid = pid.value;
                     skip_gen = geo.generation;
+                    skip_big = false;
+                    continue;
+                }
+                /* v0.7.19: above 1080p (a 2560x1440 mod, #48) the frame does not fit
+                 * the capture region: say so once and wait for new buffers, instead
+                 * of attaching and failing every 5 s */
+                if (geo.width > 1920 || geo.height > 1088) {
+                    DbgDetach(dbg);
+                    LogLine("   live: this game draws at %ux%u - above 1080p, not streamed (until it makes new frame buffers)", geo.width, geo.height);
+                    skip_pid = pid.value;
+                    skip_gen = geo.generation;
+                    skip_big = true;
+                    SetViewerReason(ViewerReason_TooBig);
                     continue;
                 }
                 if (!DbgIsDmnt(dbg)) { DebugPumpStart(dbg); }
                 g_reconfig_request.store(false, std::memory_order_relaxed);   /* this session starts with the current settings */
                 const GameSurface *gp = (geo.num_slots != 0 && geo.buf_size != 0) ? std::addressof(geo) : nullptr;
+                const AttachRecord attached = NoteAttach(pid.value, applet_target);   /* v0.7.19: auto-skip */
                 const StreamEnd end = g_uvc_raw ? TryUvcRawStream(dbg, slot_base, vfd, nvmap_fd, cmd_handle, syncpt, cfg_addr, gp)
                                                 : TryNvencStream(dbg, slot_base, vfd, nvmap_fd, cmd_handle, syncpt, cfg_addr, true, gp);
+                const bool target_exited = !DbgIsDmnt(dbg) && DebugPumpTargetGone();
                 if (!DbgIsDmnt(dbg)) { DebugPumpStop(); }
                 DbgDetach(dbg);
                 g_live_fps_x10.store(0, std::memory_order_relaxed);
@@ -3717,6 +3769,7 @@ namespace ams::mitm::applet {
                                                      "the picture size changed - restarting at the new size", "turned off from the overlay",
                                                      "a 1080p picture - setting up again on the full memory loan" };
                 LogLine("   live[%u]: session ended - %s; detached", sessions, names[static_cast<int>(end)]);
+                if (end == StreamEnd::GameGone && target_exited) { AutoSkipIfClosedAtOnce(attached); }
                 /* Viewer closed while capturing: CaptureRelease alone leaves the
                  * donor mapped. A later HOME into SwitchU Album then races that
                  * ~42 MB. Free it now when home_menu is not about to reuse it. */
@@ -6022,6 +6075,9 @@ namespace ams::mitm::applet {
          * outside the corner and the game's own crop still count. */
         constinit u64 g_stale_switch_pid = 0, g_stale_switch_ns = 0;
         constinit u64 g_stale_unreliable_pid = 0;
+        /* v0.7.19: and for the game itself (its program id) for the rest of the
+         * boot - Diva learned it again after every restart of the game (#43) */
+        constinit u64 g_stale_unreliable_tid = 0;
 
         struct SizeCheck {
             bool started_corner = false;
@@ -6068,7 +6124,8 @@ namespace ams::mitm::applet {
                 }
                 const ContentProbe pr = ProbeContent(dbg, addr, stride_px, bh_log2);
                 ContentProbe &prev = last[static_cast<u32>(slot) & 7];
-                const bool stale_ok = pid == 0 || g_stale_unreliable_pid != pid;   /* v0.7.18 */
+                const u64 tid = g_app_tid.load(std::memory_order_relaxed);
+                const bool stale_ok = pid == 0 || (g_stale_unreliable_pid != pid && (tid == 0 || g_stale_unreliable_tid != tid));   /* v0.7.18, v0.7.19 */
                 s32 vote = -1;    /* 1: 720p (black outside), 2: 720p (old picture outside), 0: 1080p, -1: no evidence */
                 if (pr.ok) {
                     const bool moved_in  = prev.ok && pr.inside_hash != prev.inside_hash;
@@ -6093,6 +6150,7 @@ namespace ams::mitm::applet {
                     /* v0.7.18: back to 1080p soon after a stale switch - that was a still background */
                     if (pid != 0 && g_stale_switch_pid == pid && now - g_stale_switch_ns < UINT64_C(30000000000) && g_stale_unreliable_pid != pid) {
                         g_stale_unreliable_pid = pid;
+                        g_stale_unreliable_tid = g_app_tid.load(std::memory_order_relaxed);
                         LogLine("   nvstream: the picture outside the corner only stood still - this game is not taken for 720p by that again");
                     }
                     return Switch(false, "the game switched to a 1080p picture");
@@ -7770,7 +7828,8 @@ namespace ams::mitm::applet {
              * MP4 stays one file (#44) */
             u32 lock = (live && !uvc) ? g_size_lock.load(std::memory_order_relaxed) : 0;
             if (lock == ~0u) {
-                lock = full1080 ? (1920u << 16 | 1080u) : (1280u << 16 | 720u);
+                /* v0.7.19: the HOME menu's session too goes to 1080p (above) */
+                lock = (full1080 || (g_ui_session_active.load(std::memory_order_relaxed) && !g_cap720_armed)) ? (1920u << 16 | 1080u) : (1280u << 16 | 720u);
                 g_size_lock.store(lock, std::memory_order_relaxed);
             }
             const bool lock1080 = lock != 0 && (lock >> 16) == 1920;
