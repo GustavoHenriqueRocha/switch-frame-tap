@@ -1658,16 +1658,18 @@ namespace ams::mitm::applet {
         if (R_FAILED(usbDsEndpoint_GetReportData(ep, std::addressof(report))) ||
             R_FAILED(usbDsParseReportData(std::addressof(report), g_bye_urb, nullptr, std::addressof(got)))) { return false; }
         /* v0.7.16: "SFTC" after the SFTK - this viewer draws crops itself */
+        bool restart = false;   /* v0.7.19: the size lock restarts the session */
         for (u32 k = 0; k + 4 <= got && k + 4 <= sizeof(::ams::g_usb_ep_out_buf); k += 4) {
             if (std::memcmp(::ams::g_usb_ep_out_buf + k, "SFTC", 4) == 0) { g_viewer_crop.store(true, std::memory_order_relaxed); }
             /* v0.7.17: "SFTD" - it records: the pictures cropped here, not in the viewer */
             if (std::memcmp(::ams::g_usb_ep_out_buf + k, "SFTD", 4) == 0) { g_viewer_crop.store(false, std::memory_order_relaxed); }
             /* v0.7.18: "SFTL" / "SFTU" - it records: one stream size until it stops (#44) */
-            if (std::memcmp(::ams::g_usb_ep_out_buf + k, "SFTL", 4) == 0) { ViewerLockSize(true); }
+            if (std::memcmp(::ams::g_usb_ep_out_buf + k, "SFTL", 4) == 0 && ViewerLockSize(true)) { restart = true; }
             if (std::memcmp(::ams::g_usb_ep_out_buf + k, "SFTU", 4) == 0) { ViewerLockSize(false); }
         }
         /* v0.7.13: "SFTK" - the viewer wants a keyframe (a new decoder, a recording) */
-        if (got >= 4 && std::memcmp(::ams::g_usb_ep_out_buf, "SFTK", 4) == 0) { g_viewer_key_request.store(true, std::memory_order_relaxed); return false; }
+        /* (v0.7.19: not when the size lock restarts the session - it starts with one) */
+        if (got >= 4 && std::memcmp(::ams::g_usb_ep_out_buf, "SFTK", 4) == 0) { if (!restart) { g_viewer_key_request.store(true, std::memory_order_relaxed); } return false; }
         const bool bye = got >= 4 && std::memcmp(::ams::g_usb_ep_out_buf, "SFTQ", 4) == 0;
         if (bye) { g_viewer_crop.store(false, std::memory_order_relaxed); ViewerLockSize(false); }
         return bye;

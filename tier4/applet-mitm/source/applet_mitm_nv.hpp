@@ -164,7 +164,7 @@ namespace ams::mitm::applet {
      * locked; ~0: lock at the next session's size; else w << 16 | h. "SFTU",
      * SFTQ or the viewer going away unlock it. */
     extern std::atomic<u32> g_size_lock;
-    void ViewerLockSize(bool lock);
+    bool ViewerLockSize(bool lock);   /* v0.7.19: true - the session restarts at the locked size (its first frame is a keyframe) */
     extern std::atomic<u64> g_queue_fence[4];
     /* M89: a seqlock over slot + fence: odd while the binder thread writes */
     extern std::atomic<u32> g_queue_seq;
