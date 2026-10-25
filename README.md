@@ -418,7 +418,9 @@ and pick **Docked (1080p)** in the Switch Frame Tap overlay (or ReverseNX-RT's
 own): the game renders its docked picture and the stream switches to
 1920x1080 by itself. 1080p60 wants **CPU 1785 MHz** (Nintendo's own boost
 clock; GPU 768 / RAM 1600, the docked values) from a clock tool such as
-Horizon OC or sys-clk; at the stock 1020 MHz it runs, a little below 60.
+Horizon OC or sys-clk. At the stock handheld clocks (CPU 1020, RAM 1331) a
+heavy game streams far below 60 at 1080p - Mario Kart 8 about 25 fps - since
+each 1080p frame takes ~18 ms to read; light games keep up.
 Expect more heat and battery drain, and some games dislike fake docked mode
 (MK8D crashes with Joy-Cons attached; use a Pro Controller).
 
