@@ -402,8 +402,10 @@ shows while it records, and the title bar the time and size. At 1080p it is
 about 10 MB a second (~600 MB a minute) at High quality, half that at Medium. The file is written in fragments, so
 a recording cut short by closing the window or pulling the cable still plays;
 if the game switches between 720p and 1080p mid-recording it continues in a
-new file; it will not start with less than 1 GB free and stops by itself
-below 500 MB.
+new file - or, with **One file per recording** on (Settings, also in the
+Android app), the console keeps the size the recording started at and scales
+other sizes to it, so it stays one file (scaled pictures look a little softer);
+it will not start with less than 1 GB free and stops by itself below 500 MB.
 
 **3. Stream.** Connect the Switch (handheld) to the PC with the USB-C cable,
 open the viewer and start a game. The picture appears a few seconds after the

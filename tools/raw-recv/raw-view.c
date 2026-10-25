@@ -157,6 +157,10 @@ static int g_chromeless = 0;
 static int g_chromeless_cli = -1;
 /* Keep the viewer above other windows (chrome pin / viewer.ini). */
 static int g_always_on_top = 0;
+/* v0.7.19: while recording, ask the console to keep one picture size (the
+ * v0.7.18 lock, SFTL) so the MP4 stays one file - it then scales pictures of
+ * another size. Off: never scaled; a new file starts when the size changes. */
+static int g_rec_one_file = 0;
 static int g_drag_pending = 0, g_dragging = 0;
 static int g_drag_ox, g_drag_oy, g_drag_wx, g_drag_wy;
 static int g_drag_sx, g_drag_sy; /* global mouse at button-down (absolute threshold) */
@@ -637,6 +641,7 @@ static void prefs_load(void)
         if (sscanf(line, "lock_aspect=%d", &hm) == 1) g_lock_aspect = hm != 0;
         if (sscanf(line, "chromeless=%d", &hm) == 1) g_chromeless = hm != 0;
         if (sscanf(line, "always_on_top=%d", &hm) == 1) g_always_on_top = hm != 0;
+        if (sscanf(line, "one_file_recording=%d", &hm) == 1) g_rec_one_file = hm != 0;
         if (sscanf(line, "picture=%127s", v) == 1) pic_parse(v);
         if (sscanf(line, "window=%d,%d,%d,%d", &g_geom_x, &g_geom_y, &g_geom_w, &g_geom_h) == 4 &&
             g_geom_w >= 160 && g_geom_h >= 90) g_geom_valid = 1;
@@ -715,6 +720,7 @@ static void prefs_save(void)
     fprintf(f, "connection=%s\nlast_ip=%s\nstats_overlay=%d\nvsync=%d\nupscaler=%s\nhwdec=%d\nlock_aspect=%d\nchromeless=%d\nalways_on_top=%d\npicture=%d,%d,%d,%d,%d\n", g_conn == CONN_NET ? "network" : "usb", g_last_ip, g_hud, g_vsync, up_key[g_upscaler], g_hwdec, g_lock_aspect, g_chromeless, g_always_on_top,
             g_pic.bright, g_pic.contrast, g_pic.sat, g_pic.gamma10, g_pic.sharp);
     fprintf(f, "fsr_sharpness=%d\n", g_fsr_sharpness);
+    fprintf(f, "one_file_recording=%d\n", g_rec_one_file);
     fprintf(f, "update_betas=%d\nupdate_check=%d\n", g_upd_betas, g_upd_check);
     if (g_geom_valid)
         fprintf(f, "window=%d,%d,%d,%d\nmaximized=%d\n", g_geom_x, g_geom_y, g_geom_w, g_geom_h, g_geom_maximized);
@@ -1139,9 +1145,11 @@ static void key_send_pending(void)
     /* v0.7.18: + "SFTL" while recording - the console keeps the stream at the
      * size the recording started at (it scales the picture), so the MP4 stays
      * one file; "SFTU" lets it follow the game again (#44). */
+    /* v0.7.19: "SFTL" only with "One file per recording" on (Settings) */
     static const unsigned char msg_crop[12] = { 'S', 'F', 'T', 'K', 'S', 'F', 'T', 'C', 'S', 'F', 'T', 'U' };
     static const unsigned char msg_nocrop[12] = { 'S', 'F', 'T', 'K', 'S', 'F', 'T', 'D', 'S', 'F', 'T', 'L' };
-    const unsigned char *msg = rec_active() ? msg_nocrop : msg_crop;
+    static const unsigned char msg_nocrop_free[12] = { 'S', 'F', 'T', 'K', 'S', 'F', 'T', 'D', 'S', 'F', 'T', 'U' };
+    const unsigned char *msg = rec_active() ? (g_rec_one_file ? msg_nocrop : msg_nocrop_free) : msg_crop;
     if (g_sock != SOCK_BAD) { send(g_sock, (const char *)msg, sizeof(msg_crop), 0); }
     else if (g_usb) {
         /* v0.7.18: the console takes a request only while a buffer of its own
@@ -1615,6 +1623,15 @@ static void act_vsync(SDL_Renderer *ren, int on)
     prefs_save();
     hud_toast(g_vsync ? "Vsync on" : "Vsync off: lower latency, may tear");
     fprintf(stderr, "\nvsync %s\n", g_vsync ? "on" : "off");
+}
+
+static void act_rec_one_file(int on)
+{
+    g_rec_one_file = on != 0;
+    prefs_save();
+    if (rec_active()) key_request();   /* the console hears it now (SFTL / SFTU) */
+    hud_toast(g_rec_one_file ? "One file per recording" : "Recordings follow the picture size");
+    fprintf(stderr, "\none file per recording %s\n", g_rec_one_file ? "on" : "off");
 }
 
 static void act_lock_aspect(SDL_Window *win, int on)

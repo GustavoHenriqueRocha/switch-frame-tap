@@ -266,6 +266,12 @@ public final class MainActivity extends Activity implements SurfaceHolder.Callba
         section(body, "CAPTURE");
         actionRow(body, "Screenshot", "A PNG in Pictures/" + Capture.FOLDER + (tv ? " · P key" : ""), v -> { closeDrawer(); handler.postDelayed(this::screenshot, 250); });
         recordToggle = switchRow(body, "Record", "An MP4 with sound in Movies/" + Capture.FOLDER + (tv ? " · R or Record key" : ""), v -> toggleRecording());
+        // v0.7.19: the v0.7.18 size lock, now a choice (off: never scaled, a new file when the size changes)
+        toggleRow(body, "One file per recording", "Keeps the size the recording started at, scaling other sizes. Off: a new file when the size changes",
+                prefs.getBoolean("one_file_recording", false), value -> {
+            prefs.edit().putBoolean("one_file_recording", value).apply();
+            StreamEngine e = engine; if (e != null) e.oneFileRecording(value);
+        });
 
         section(body, "CONNECTION");
         LinearLayout conn = new LinearLayout(this); conn.setGravity(Gravity.CENTER_VERTICAL);
@@ -601,6 +607,7 @@ public final class MainActivity extends Activity implements SurfaceHolder.Callba
         };
         engine = new StreamEngine(this, picture.getHolder().getSurface(), usbMode, prefs.getString("ip", ""),
                 prefs.getString("last_ip", ""), stable, mute || !focusGranted, listener);
+        engine.oneFileRecording(prefs.getBoolean("one_file_recording", false));
         identity[0] = engine; sampledNs = System.nanoTime();
         sampledBytes = sampledFrames = sampledReceived = sampledDecoded = sampledAudio = 0;
         consoleReason = 0; consoleAt = 0;

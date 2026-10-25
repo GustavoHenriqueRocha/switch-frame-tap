@@ -40,6 +40,7 @@ final class StreamEngine {
     private volatile Recorder recorder;      // v0.7.16: recording to an MP4
     private volatile boolean keyWanted;       // ... which starts at a keyframe asked for now
     private volatile boolean unlockWanted;    // v0.7.18: recording ended - the console may change size again
+    private volatile boolean oneFile;         // v0.7.19: "One file per recording" (Settings) - the size lock is a choice
     private final Thread thread;
     StreamEngine(Context context, Surface surface, boolean usb, String address, String lastAddress,
                  boolean stableAudio, boolean muted, Listener listener) {
@@ -53,15 +54,18 @@ final class StreamEngine {
     void mute(boolean value) { muted = value; AudioPump a = audio; if (a != null) a.mute(value); }
     /** v0.7.16: every packet from now on also goes to this recording. */
     void record(Recorder r) { recorder = r; keyWanted = true; }
+    /** v0.7.19: while recording, ask the console to keep one picture size (off: a new file when it changes). */
+    void oneFileRecording(boolean value) { oneFile = value; if (recorder != null) keyWanted = true; }
     /** Ends the recording (it finishes the file on its own thread). */
     void stopRecording() {
         Recorder r = recorder; recorder = null;
         if (r != null) { r.stop(); unlockWanted = true; keyWanted = true; }
     }
     /** v0.7.18: what to ask the console for - while recording, a keyframe and one
-     *  stream size; after it, a keyframe and the size free again. */
+     *  stream size (v0.7.19: with "One file per recording" on); after it, a
+     *  keyframe and the size free again. */
     private byte[] requestNow() {
-        if (recorder != null) return SftProtocol.RECORD_LOCK;
+        if (recorder != null) return oneFile ? SftProtocol.RECORD_LOCK : SftProtocol.RECORD_UNLOCK;
         return unlockWanted ? SftProtocol.RECORD_UNLOCK : SftProtocol.KEYFRAME_REQUEST;
     }
     void stop() {

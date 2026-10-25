@@ -50,7 +50,7 @@ static void ui_open(int open);
 
 enum { H_NONE, H_SETTINGS, H_CLOSE, H_BACKDROP, H_CONN, H_IP, H_FULL, H_VSYNC, H_ASPECT, H_CHROMELESS, H_UPS, H_HUD, H_HWDEC,
        H_PIC, H_PIC_RESET, H_SOUND, H_REC, H_PANEL, H_FSR_SHARP, H_SUPPORT, H_SCROLL,
-       H_WIN_MIN, H_WIN_MAX, H_WIN_CLOSE, H_UPD, H_UPD_BETA, H_UPD_AUTO, H_PIN };
+       H_WIN_MIN, H_WIN_MAX, H_WIN_CLOSE, H_UPD, H_UPD_BETA, H_UPD_AUTO, H_PIN, H_REC1 };
 
 typedef struct { SDL_FRect r; int id, arg, window_space; } ui_hit_t;
 static ui_hit_t g_ui_hits[96];
@@ -683,6 +683,13 @@ static void ui_drawer(SDL_Renderer *ren, float x0, float y0, float pw, float ph)
             if (rec_active()) ui_button(ren, xri, 0, y + ui_d(8), "Stop", UI_BAD, (SDL_Color){ 30, 8, 8, 255 }, H_REC, 0, 1);
             else ui_button(ren, xri, 0, y + ui_d(8), "Start", UI_SURF3, UI_INK, H_REC, 0, 1);
             y += h + ui_d(2);
+            /* v0.7.19: the v0.7.18 size lock, now a choice (off by default) */
+            ui_row(H_REC1, 0, y, h);
+            ui_label(ren, cxi, y, h, "One file per recording",
+                     g_rec_one_file ? "Keeps the size it started at; other sizes are scaled" : "A new file when the picture size changes; never scaled",
+                     ui_focused(H_REC1, 0), cwi);
+            ui_toggle(ren, xri, y + ui_d(12), g_rec_one_file, H_REC1, 1);
+            y += h + ui_d(2);
             const char *dir = rec_dir_for_menu();
             if (dir[0]) {
                 char line[1100];
@@ -1211,6 +1218,7 @@ static void ui_change(SDL_Window *win, SDL_Renderer *ren, int id, int arg, int d
     case H_ASPECT: act_lock_aspect(win, !g_lock_aspect); break;
     case H_CHROMELESS: act_chromeless(win, !g_chromeless); break;
     case H_HWDEC: act_hwdec(!g_hwdec); break;
+    case H_REC1: act_rec_one_file(!g_rec_one_file); break;
     case H_UPS: act_upscaler(ren, d < 0 ? (g_upscaler + UP_COUNT - 1) % UP_COUNT : (g_upscaler + 1) % UP_COUNT); break;
     case H_HUD: act_hud(d < 0 ? (g_hud + HUD_MODES - 1) % HUD_MODES : (g_hud + 1) % HUD_MODES); break;
     case H_FSR_SHARP:
@@ -1318,6 +1326,7 @@ static int ui_event(SDL_Window *win, SDL_Renderer *ren, const SDL_Event *e)
             case H_FULL: act_fullscreen(win); break;
             case H_VSYNC: act_vsync(ren, h->arg); break;
             case H_ASPECT: act_lock_aspect(win, h->arg); break;
+            case H_REC1: act_rec_one_file(!g_rec_one_file); break;
             case H_CHROMELESS: act_chromeless(win, h->arg); break;
             case H_HWDEC: act_hwdec(h->arg); break;
             case H_UPS: act_upscaler(ren, h->arg); break;
