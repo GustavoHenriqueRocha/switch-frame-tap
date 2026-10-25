@@ -45,6 +45,14 @@
   <content_rating type="oars-1.1"/>
   
   <releases>
+    <release version="0.7.19" date="2026-10-25">
+      <description>
+        <ul>
+          <li>One file per recording is a setting now, off by default: recordings start a new file when the picture size changes and are never scaled.</li>
+          <li>No empty 0-second file when the picture size changes right as a recording starts.</li>
+        </ul>
+      </description>
+    </release>
     <release version="0.7.18.1" date="2026-10-25">
       <description>
         <p>Viewer unchanged; the Switch side lets homebrew from forwarders run in docked mode.</p>
