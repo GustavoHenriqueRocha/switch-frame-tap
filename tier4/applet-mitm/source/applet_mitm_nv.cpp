@@ -1927,9 +1927,6 @@ namespace ams::mitm::applet {
     void ViewerLockSize(bool lock) {
         if (!lock) { g_size_lock.store(0, std::memory_order_relaxed); return; }
         if (g_size_lock.load(std::memory_order_relaxed) != 0) { return; }   /* already: a repeated request */
-        /* v0.7.19: started on the HOME menu (always 720p), a recording is 1080p
-         * - else a 1080p game started from there went into it at 720p (#43) */
-        if (g_ui_session_active.load(std::memory_order_relaxed) && !g_cap720_armed) { g_size_lock.store(1920u << 16 | 1080u, std::memory_order_relaxed); return; }
         const u32 w = g_live_w.load(std::memory_order_relaxed), h = g_live_h.load(std::memory_order_relaxed);
         g_size_lock.store(g_streaming_now.load(std::memory_order_relaxed) && w != 0 ? (w << 16 | h) : ~0u, std::memory_order_relaxed);
     }
@@ -7843,8 +7840,7 @@ namespace ams::mitm::applet {
              * MP4 stays one file (#44) */
             u32 lock = (live && !uvc) ? g_size_lock.load(std::memory_order_relaxed) : 0;
             if (lock == ~0u) {
-                /* v0.7.19: the HOME menu's session too goes to 1080p (above) */
-                lock = (full1080 || (g_ui_session_active.load(std::memory_order_relaxed) && !g_cap720_armed)) ? (1920u << 16 | 1080u) : (1280u << 16 | 720u);
+                lock = full1080 ? (1920u << 16 | 1080u) : (1280u << 16 | 720u);
                 g_size_lock.store(lock, std::memory_order_relaxed);
             }
             const bool lock1080 = lock != 0 && (lock >> 16) == 1920;
