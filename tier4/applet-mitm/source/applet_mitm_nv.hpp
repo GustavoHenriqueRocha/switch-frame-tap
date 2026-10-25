@@ -164,7 +164,7 @@ namespace ams::mitm::applet {
      * locked; ~0: lock at the next session's size; else w << 16 | h. "SFTU",
      * SFTQ or the viewer going away unlock it. */
     extern std::atomic<u32> g_size_lock;
-    bool ViewerLockSize(bool lock);   /* v0.7.19: true - the session restarts at the locked size (its first frame is a keyframe) */
+    void ViewerLockSize(bool lock);
 /* v0.7.19 research: enlarging alternates the 1-tap and 2-tap VIC filter at each
  * stream window (~20 s) and logs which one the window used - an A/B for the
  * 2-tap's cost (test4-ab: same 60 fps and VIC time, half the bitrate, lower

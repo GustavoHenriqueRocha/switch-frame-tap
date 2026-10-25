@@ -1924,25 +1924,14 @@ namespace ams::mitm::applet {
     /* v0.7.18: close the engines and set up again on the full donor (DonorCanGrow) */
     constinit std::atomic<bool> g_donor_regrow{false};
     constinit std::atomic<u32> g_size_lock{0};
-    /* v0.7.19: the running session restarts at the size a recording asked for */
-    constinit std::atomic<bool> g_lock_restart{false};
-    bool ViewerLockSize(bool lock) {
-        if (!lock) { g_size_lock.store(0, std::memory_order_relaxed); return false; }
-        if (g_size_lock.load(std::memory_order_relaxed) != 0) { return false; }   /* already: a repeated request */
-        const u32 w = g_live_w.load(std::memory_order_relaxed), h = g_live_h.load(std::memory_order_relaxed);
-        const bool streaming = g_streaming_now.load(std::memory_order_relaxed) && w != 0;
+    void ViewerLockSize(bool lock) {
+        if (!lock) { g_size_lock.store(0, std::memory_order_relaxed); return; }
+        if (g_size_lock.load(std::memory_order_relaxed) != 0) { return; }   /* already: a repeated request */
         /* v0.7.19: started on the HOME menu (always 720p), a recording is 1080p
-         * - else a 1080p game started from there went into it at 720p (#43).
-         * The HOME menu's session restarts at once at 1080p, before the
-         * keyframe the recording starts with (test1: it went on at 720p and the
-         * viewer split the file when the game came) */
-        if (g_ui_session_active.load(std::memory_order_relaxed) && !g_cap720_armed) {
-            g_size_lock.store(1920u << 16 | 1080u, std::memory_order_relaxed);
-            if (streaming && (w != 1920 || h != 1080)) { g_lock_restart.store(true, std::memory_order_relaxed); return true; }
-            return false;
-        }
-        g_size_lock.store(streaming ? (w << 16 | h) : ~0u, std::memory_order_relaxed);
-        return false;
+         * - else a 1080p game started from there went into it at 720p (#43) */
+        if (g_ui_session_active.load(std::memory_order_relaxed) && !g_cap720_armed) { g_size_lock.store(1920u << 16 | 1080u, std::memory_order_relaxed); return; }
+        const u32 w = g_live_w.load(std::memory_order_relaxed), h = g_live_h.load(std::memory_order_relaxed);
+        g_size_lock.store(g_streaming_now.load(std::memory_order_relaxed) && w != 0 ? (w << 16 | h) : ~0u, std::memory_order_relaxed);
     }
     constinit std::atomic<u64> g_queue_fence[4] = {};
     constinit std::atomic<u32> g_queue_seq{0};
@@ -8183,7 +8172,6 @@ namespace ams::mitm::applet {
                 if (live && !g_stream_enabled.load(std::memory_order_relaxed)) { why = "turned off from the overlay"; end = StreamEnd::Disabled; break; }
                 if (live && g_applet_needs_memory.load(std::memory_order_relaxed)) { why = "an applet needs the memory"; end = StreamEnd::Disabled; break; }
                 if (live && g_reconfig_request.exchange(false, std::memory_order_relaxed)) { why = "new settings from the manager app"; end = StreamEnd::Reconfigure; break; }
-                if (live && g_lock_restart.exchange(false, std::memory_order_relaxed)) { why = "the viewer records at 1080p - restarting at that size"; end = StreamEnd::Reconfigure; break; }   /* v0.7.19 */
                 if (live && g_app_excluded.load(std::memory_order_relaxed)) { why = "this app was excluded"; end = StreamEnd::Disabled; break; }
                 if (live && (i & 7) == 0 && UsbViewerSaidBye()) { why = "the viewer closed"; end = StreamEnd::ViewerGone; break; }   /* v0.7.12 */
                 /* exp/detach-on-home: present stall is a probe only - loads also

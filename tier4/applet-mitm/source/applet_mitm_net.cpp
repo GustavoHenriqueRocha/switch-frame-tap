@@ -212,7 +212,6 @@ namespace ams::mitm::applet {
                         u8 got[64];
                         const ssize_t n = bsdRecv(c, got, sizeof(got), 0);
                         if (n <= 0) { NetDropClient("the viewer closed the connection"); }
-                        bool restart = false;   /* v0.7.19: the size lock restarts the session */
                         for (ssize_t k = 0; k + 4 <= n; ++k) {
                             if (std::memcmp(got + k, "SFTK", 4) == 0) {
                                 g_viewer_can_ask.store(true, std::memory_order_relaxed);
@@ -223,12 +222,9 @@ namespace ams::mitm::applet {
                             /* v0.7.17: "SFTD" - it records: the pictures cropped here, not in the viewer */
                             if (std::memcmp(got + k, "SFTD", 4) == 0) { g_viewer_crop.store(false, std::memory_order_relaxed); }
                             /* v0.7.18: "SFTL" / "SFTU" - one stream size while it records (#44) */
-                            if (std::memcmp(got + k, "SFTL", 4) == 0 && ViewerLockSize(true)) { restart = true; }
+                            if (std::memcmp(got + k, "SFTL", 4) == 0) { ViewerLockSize(true); }
                             if (std::memcmp(got + k, "SFTU", 4) == 0) { ViewerLockSize(false); }
                         }
-                        /* the restarted session starts with a keyframe at the new size;
-                         * one at the old size would start the recording there */
-                        if (restart) { g_viewer_key_request.store(false, std::memory_order_relaxed); }
                     }
                     continue;
                 }
