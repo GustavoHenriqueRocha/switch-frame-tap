@@ -124,9 +124,16 @@ final class Recorder {
         if (p.audio()) { audio(p); return; }
         if (p.status()) return;
         if (videoFormat != null && p.key() && (p.width != width || p.height != height)) {
-            // docked <-> handheld, the HOME menu at 720p: an MP4 track keeps one
-            // picture size, so this file ends and the next one goes on (as the PC viewer does)
-            split = true; stopping = true; return;
+            // v0.7.19: in the first half second, before anything is written, this is
+            // the console switching to the size the recording asked for (one
+            // started on the HOME menu): start over at this keyframe, no 0 s file
+            if (!started && p.receivedNs - keyNs < 500_000_000L) {
+                videoFormat = null; pendingVideo.clear();
+            } else {
+                // docked <-> handheld, the HOME menu at 720p: an MP4 track keeps one
+                // picture size, so this file ends and the next one goes on (as the PC viewer does)
+                split = true; stopping = true; return;
+            }
         }
         if (videoFormat == null) {
             if (!p.key()) return;   // the file starts at a keyframe

@@ -319,6 +319,8 @@ static void rec_audio_fill_to(rec_file_t *f, int64_t to)
 static void rec_close_file(rec_file_t *f, const char *why)
 {
     if (!f->fc) return;
+    /* v0.7.19: why == "": a start fragment that is dropped - closed quietly
+     * and deleted by the caller */
     if (f->ac) {
         /* the sound as long as the picture (the last frame's time) */
         if (f->last_vpts > 0) rec_audio_fill_to(f, av_rescale(f->last_vpts, 48000, 90000) - f->a_off);
@@ -337,6 +339,7 @@ static void rec_close_file(rec_file_t *f, const char *why)
     if (f->ac) avcodec_free_context(&f->ac);
     av_frame_free(&f->af);
     av_packet_free(&f->pkt);
+    if (why && !*why) return;
     rec_msg("saved %s (%.0f MB, %.0f s)%s%s", g_rec.path, g_rec.mb, g_rec.secs, why ? " - " : "", why ? why : "");
 }
 
@@ -488,8 +491,19 @@ static int rec_main(void *arg)
         }
         if (!it->audio) {
             if (f.fc && (it->w != f.w || it->h != f.h)) {
-                rec_close_file(&f, "the picture size changed, continuing in a new file");
-                if (g_rec.fixed_path) { free(it); g_rec.state = REC_OFF; continue; }
+                /* v0.7.19: a size change in the first half second is the console
+                 * switching to the size the recording asked for (SFTL, a recording
+                 * started on the HOME menu): the keyframe before it was in flight.
+                 * That fragment is dropped, not saved as a 0 s file. */
+                if (!g_rec.fixed_path && g_rec.secs < 0.5) {
+                    char dropped[sizeof(g_rec.path)];
+                    snprintf(dropped, sizeof(dropped), "%s", g_rec.path);
+                    rec_close_file(&f, "");
+                    remove(dropped);
+                } else {
+                    rec_close_file(&f, "the picture size changed, continuing in a new file");
+                    if (g_rec.fixed_path) { free(it); g_rec.state = REC_OFF; continue; }
+                }
             }
             if (!f.fc) {
                 if (!it->key) { free(it); continue; }

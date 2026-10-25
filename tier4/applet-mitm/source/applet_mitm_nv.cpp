@@ -1059,6 +1059,16 @@ namespace ams::mitm::applet {
             slot->DestRectTop         = 0;
             slot->DestRectBottom      = out.h - 1;
             slot->SoftClampHigh       = 1023;
+            /* v0.7.19: enlarging (the HOME menu's 720p, or a handheld picture, in
+             * a 1080p recording) came out blocky - the VIC's default, a 1-tap
+             * filter. 2 taps, no coefficient table (5 taps without one came out
+             * "very blurry", ovl4). Shrinking and 1:1 stay as they were. */
+            if (out.w > src.rect_w || out.h > src.rect_h) {
+                slot->FilterLengthX = out.w > src.rect_w ? 1 : 0;
+                slot->FilterLengthY = out.h > src.rect_h ? 1 : 0;
+                static bool said = false;
+                if (!said) { said = true; LogLine("   vic: enlarging %ux%u to %ux%u - 2-tap filter", src.rect_w, src.rect_h, out.w, out.h); }
+            }
 
             vic::SlotSurfaceConfig *s = std::addressof(c->slotStruct[0].slotSurfaceConfig);
             s->SlotPixelFormat   = src.pixfmt;
