@@ -248,7 +248,7 @@ namespace {
     class MainGui : public tsl::Gui {
         public:
             tsl::elm::Element *createUI() override {
-                auto *frame = new tsl::elm::OverlayFrame("Switch Frame Tap", "v0.7.18.1");
+                auto *frame = new tsl::elm::OverlayFrame("Switch Frame Tap", "v0.7.19");
                 auto *list = new tsl::elm::List();
 
                 list->addItem(new tsl::elm::CategoryHeader("Stream to PC"));
