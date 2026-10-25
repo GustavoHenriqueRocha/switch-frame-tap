@@ -1035,6 +1035,9 @@ namespace ams::mitm::applet {
             c->outputConfig.BackgroundB     = 256;    /* 0x40 */
         }
 
+        constinit std::atomic<bool> g_enlarge_2tap{true};     /* v0.7.19 (the A/B probe flips it) */
+        constinit std::atomic<bool> g_enlarged_window{false};  /* this stream window enlarged */
+
         void FillBlitConfig(vic::VicConfigStruct *c, const SrcDesc &src, const OutDesc &out) {
             std::memset(c, 0, sizeof(*c));
 
@@ -1064,8 +1067,10 @@ namespace ams::mitm::applet {
              * filter. 2 taps, no coefficient table (5 taps without one came out
              * "very blurry", ovl4). Shrinking and 1:1 stay as they were. */
             if (out.w > src.rect_w || out.h > src.rect_h) {
-                slot->FilterLengthX = out.w > src.rect_w ? 1 : 0;
-                slot->FilterLengthY = out.h > src.rect_h ? 1 : 0;
+                g_enlarged_window.store(true, std::memory_order_relaxed);
+                const u64 taps = g_enlarge_2tap.load(std::memory_order_relaxed) ? 1 : 0;
+                slot->FilterLengthX = out.w > src.rect_w ? taps : 0;
+                slot->FilterLengthY = out.h > src.rect_h ? taps : 0;
                 static bool said = false;
                 if (!said) { said = true; LogLine("   vic: enlarging %ux%u to %ux%u - 2-tap filter", src.rect_w, src.rect_h, out.w, out.h); }
             }
@@ -8401,6 +8406,13 @@ namespace ams::mitm::applet {
                                 static_cast<unsigned long long>(w_vic / wd / 1000), static_cast<unsigned long long>(w_enc / wd / 1000),
                                 static_cast<unsigned long long>(fw ? (s.fence_wait_sum - w_fence0) / fw / 1000 : 0),
                                 s.pick_ready - w_ready0, s.pick_waited - w_waited0, dropped - w_drop0);
+#if SFT_FILTER_AB_PROBE
+                        if (g_enlarged_window.exchange(false, std::memory_order_relaxed)) {
+                            const bool two = g_enlarge_2tap.load(std::memory_order_relaxed);
+                            LogLine("   filter A/B: that window enlarged with the %s filter - the next one uses the %s", two ? "2-tap" : "1-tap", two ? "1-tap" : "2-tap");
+                            g_enlarge_2tap.store(!two, std::memory_order_relaxed);
+                        }
+#endif
                         w_n = 0; w_read = w_flush = w_vic = w_enc = 0; w_t0 = wn; w_sent0 = sent;
                         w_fwait0 = s.fence_waits; w_fence0 = s.fence_wait_sum;
                         w_ready0 = s.pick_ready; w_waited0 = s.pick_waited; w_drop0 = dropped;
