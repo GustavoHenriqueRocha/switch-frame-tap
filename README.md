@@ -171,7 +171,7 @@ animation.*
 | Resolution / frame rate | **1920x1080** when the game renders it (docked picture via ReverseNX-RT): MK8D 58.4 fps over a session, 59.5-59.9 per window; 1280x720 native handheld: MK8D 57-59 fps, BOTW 29 fps |
 | Transport | USB 2.0 bulk, the Switch's own USB-C port, no dock; or TCP over Wi-Fi / the dock's LAN port (v0.7.0), the quality adapting to the link |
 | Audio | the game's sound, 48 kHz stereo PCM, from the console's own recorder (grc:d); ~1.5 Mbps alongside the video |
-| Video | H.264 from the Switch's NVENC, constant QP 20 (P frames 22, v0.6.0), keyframe every 60 frames; 1080p ~80 Mbps in a fast race, 720p about half; the manager's Medium / Low quality roughly half / a third of that |
+| Video | H.264 from the Switch's NVENC, constant QP 20 (P frames 22, v0.6.0), keyframe every 60 frames (live to the viewer over USB or Wi-Fi: every 240, plus one whenever the viewer asks); 1080p ~80 Mbps in a fast race, 720p about half; the manager's Medium / Low quality roughly half / a third of that |
 | Latency | 720p: ~20-23 ms on the console (game present -> sent) + ~21-24 ms on the PC (arrival -> on screen); 1080p: ~34 + ~25 ms |
 | Reliability | 0 lost / 0 undecodable frames in every run since M84; 0 stale or torn frames (M89) |
 | Console | Mariko, firmware 22.5.0, Atmosphère 1.11.2 (the author's); users report a Switch Lite on 23.0.0 with Atmosphère 1.12.0 |

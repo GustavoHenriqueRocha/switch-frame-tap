@@ -26,6 +26,8 @@ trap 'rm -rf "$tmp"' EXIT
 echo "switch-frame-tap PC-side checks"
 run "arm-file parser (whole tokens, numbers)" \
     bash -c "g++ -std=c++20 -Itier4/applet-mitm/source tier4/applet-mitm/test/armfile_test.cpp -o $tmp/armfile_test && $tmp/armfile_test"
+run "keyframe spacing over USB / network (usb_keyframe_interval)" \
+    bash -c "g++ -std=c++20 -Wall -Wextra -Werror -Itier4/applet-mitm/source tier4/applet-mitm/test/gop_test.cpp -o $tmp/gop_test && $tmp/gop_test"
 run "version order for the updaters (common/sft_version.h)" \
     bash -c "gcc -std=c99 -Wall common/test/version_test.c -o $tmp/version_test && $tmp/version_test"
 run "early encode collection: pending, ready, once only, cancelled (PR #12)" \
