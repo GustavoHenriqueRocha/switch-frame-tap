@@ -293,7 +293,7 @@ switch-frame-tap-<version>-linux.flatpak` (its runtime comes from Flathub). For
 USB, both need the USB rule once:
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/TomasUribe/switch-frame-tap/master/tools/raw-recv/99-switch-frame-tap.rules | sudo tee /etc/udev/rules.d/99-switch-frame-tap.rules && sudo udevadm control --reload-rules && sudo udevadm trigger
+curl -fsSL https://raw.githubusercontent.com/TomasUribe/switch-frame-tap/master/tools/raw-recv/70-switch-frame-tap.rules | sudo tee /etc/udev/rules.d/70-switch-frame-tap.rules && sudo rm -f /etc/udev/rules.d/99-switch-frame-tap.rules && sudo udevadm control --reload-rules && sudo udevadm trigger
 ```
 
 On **KDE Plasma** the viewer uses the session's Wayland driver when there is
@@ -313,7 +313,7 @@ To build it from source instead (Ubuntu/Debian):
 
 ```bash
 sudo apt install build-essential libusb-1.0-0-dev libsdl2-dev libavcodec-dev libavutil-dev libavformat-dev
-sudo cp tools/raw-recv/99-switch-frame-tap.rules /etc/udev/rules.d/
+sudo cp tools/raw-recv/70-switch-frame-tap.rules /etc/udev/rules.d/
 sudo udevadm control --reload-rules && sudo udevadm trigger
 bash tools/raw-recv/install-launcher.sh
 ```
